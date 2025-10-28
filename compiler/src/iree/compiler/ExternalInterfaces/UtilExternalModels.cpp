@@ -515,14 +515,14 @@ void registerUtilExternalModels(DialectRegistry &registry) {
       });
 
   // Register hoistable op interfaces for Flow ops.
-  registry.addExtension(
-      +[](MLIRContext *context, IREE::Flow::FlowDialect *dialect) {
-        UnhoistableOpInterfaceHelper<
-            IREE::Flow::DispatchWorkgroupCountOp>::registerOpInterface(context);
+  // registry.addExtension(
+  //     +[](MLIRContext *context, IREE::Flow::FlowDialect *dialect) {
+  //       UnhoistableOpInterfaceHelper<
+  //           IREE::Flow::DispatchWorkgroupCountOp>::registerOpInterface(context);
 
-        AlwaysHoistableOpInterfaceHelper<
-            IREE::Flow::TensorEncodeOp>::registerOpInterface(context);
-      });
+  //       AlwaysHoistableOpInterfaceHelper<
+  //           IREE::Flow::TensorEncodeOp>::registerOpInterface(context);
+  //     });
 
   // Register hoistable op interfaces for linalg ops.
   // We have a specific allow-list for Linalg ops because we want to consider
