@@ -38,8 +38,16 @@ namespace {
 // --iree-hal-outline-memoize-regions
 //===----------------------------------------------------------------------===//
 
+static std::atomic<uint32_t> sHackCounter { 0 };
 static std::string getMemoizeNamePrefix(IREE::HAL::DeviceMemoizeOp memoizeOp) {
   auto parentOp = memoizeOp->getParentOfType<FunctionOpInterface>();
+  if (parentOp.getNameAttr() == nullptr)
+  {
+      //memoizeOp.dump();
+      //parentOp.dump();
+      uint32_t index = sHackCounter.fetch_add(1, std::memory_order_relaxed);
+      parentOp.setName(std::string("NoneHack_") + std::to_string(index));
+  }
   return ("__" + parentOp.getName() + "_memoize").str();
 }
 
