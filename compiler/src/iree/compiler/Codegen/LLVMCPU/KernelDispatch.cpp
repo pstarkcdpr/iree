@@ -1991,6 +1991,9 @@ static LogicalResult setRootConfig(mlir::FunctionOpInterface entryPointFn,
     }
   }
   TileSizesListType tileSizes = {distTileSizes};
+  SmallVector<int64_t> zeros(rank, 0);
+  tileSizes.push_back(zeros);
+  tileSizes.push_back(zeros);
   return setOpConfigAndEntryPointFnTranslation(
       entryPointFn, fftOp, tileSizes, DispatchLoweringPassPipeline::CPUDefault);
 }
