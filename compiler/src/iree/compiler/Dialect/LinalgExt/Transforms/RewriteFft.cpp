@@ -41,22 +41,30 @@ static SmallVector<Value> getBitReversalOrder(ImplicitLocOpBuilder &b,
                                               int64_t fftLength) {
   ShapedType realType = llvm::cast<ShapedType>(real.getType());
   int64_t rank = realType.getRank();
+  auto realElementType = realType.getElementType();
 
   SmallVector<OpFoldResult> mixedSizes =
       tensor::getMixedSizes(b, b.getLoc(), real);
-  Value emptyTensor =
-      b.create<tensor::EmptyOp>(mixedSizes, realType.getElementType());
+
+  SmallVector<Value> outs;
+  outs.push_back(b.create<tensor::EmptyOp>(mixedSizes, realElementType));
+  outs.push_back(b.create<tensor::EmptyOp>(mixedSizes, realElementType));
 
   SmallVector<AffineMap> maps;
-  maps.push_back(
-      AffineMap::get(rank, 0, b.getAffineDimExpr(rank - 1), b.getContext()));
-  maps.push_back(b.getMultiDimIdentityMap(rank));
+  maps.push_back(AffineMap::get(rank, 0,
+                                b.getAffineDimExpr(rank - 1),
+                                b.getContext())); // input i64 tensor
+  maps.push_back(b.getMultiDimIdentityMap(rank)); // output float
+  maps.push_back(b.getMultiDimIdentityMap(rank)); // output float
   SmallVector<utils::IteratorType> iterTypes(rank,
-                                              utils::IteratorType::parallel);
+                                             utils::IteratorType::parallel);
+
+  Value zero = b.create<arith::ConstantOp>(realElementType,
+      b.getFloatAttr(realElementType, 0.0));
 
   Value indices = getBitReversalBuffer(b, fftLength);
   auto genericOp = b.create<linalg::GenericOp>(
-      TypeRange{realType}, indices, emptyTensor, maps, iterTypes,
+      TypeRange{outs}, indices, outs, maps, iterTypes,
       [&](OpBuilder &b, Location loc, ValueRange args) {
         SmallVector<Value> ivs;
         for (auto i : llvm::seq<uint64_t>(0, rank - 1)) {
@@ -64,15 +72,11 @@ static SmallVector<Value> getBitReversalOrder(ImplicitLocOpBuilder &b,
         }
         ivs.push_back(
             b.create<arith::IndexCastOp>(loc, b.getIndexType(), args[0]));
-        b.create<linalg::YieldOp>(
-            loc, b.create<tensor::ExtractOp>(loc, real, ivs).getResult());
+        b.create<linalg::YieldOp>(loc, SmallVector<Value> {
+          b.create<tensor::ExtractOp>(loc, real, ivs).getResult(),
+          zero } );
       });
-  return {genericOp.getResult(0),
-          b.create<arith::ConstantOp>(
-              realType,
-              DenseFPElementsAttr::get(
-                  realType,
-                  llvm::cast<Attribute>(b.getFloatAttr(realType, 0.0))))};
+  return genericOp.getResults();
 }
 
 // Create the shuffled inputs for a complex-valued FFT.
@@ -95,11 +99,12 @@ static SmallVector<Value> getBitReversalOrderComplex(ImplicitLocOpBuilder &b,
   auto complexType = llvm::cast<ComplexType>(shapeType.getElementType());
   auto complexElemType = complexType.getElementType();
 
+    SmallVector<OpFoldResult> mixedSizes =
+      tensor::getMixedSizes(b, b.getLoc(), complexTensor);
+
   SmallVector<Value> outs;
-  outs.push_back(b.create<tensor::EmptyOp>(
-    tensor::getMixedSizes(b, b.getLoc(), complexTensor), complexElemType));
-  outs.push_back(b.create<tensor::EmptyOp>(
-    tensor::getMixedSizes(b, b.getLoc(), complexTensor), complexElemType));
+  outs.push_back(b.create<tensor::EmptyOp>(mixedSizes, complexElemType));
+  outs.push_back(b.create<tensor::EmptyOp>(mixedSizes, complexElemType));
 
   SmallVector<AffineMap> maps;
   maps.push_back(AffineMap::get(rank, 0,
@@ -133,7 +138,7 @@ static SmallVector<Value> getBitReversalOrderComplex(ImplicitLocOpBuilder &b,
         if (hasScale) {
           b.create<linalg::YieldOp>(loc, SmallVector<Value> {
             b.create<arith::MulFOp>(loc, realPart, scaleValue).getResult(),
-            b.create<arith::MulFOp>(loc, imagPart, scaleValue).getResult() } );
+            b.create<arith::MulFOp>(loc, imagPart, scaleValue).getResult()});
         } else {
           b.create<linalg::YieldOp>(
               loc, SmallVector<Value>{realPart.getResult(),
@@ -160,10 +165,11 @@ static SmallVector<Value> getCoeffConstants(ImplicitLocOpBuilder &b,
   auto type = RankedTensorType::get({mh}, b.getF32Type());
   return {
       b.create<arith::ConstantOp>(type, DenseFPElementsAttr::get(type, real)),
-      b.create<arith::ConstantOp>(type,
-                                  DenseFPElementsAttr::get(type, imag))};
+      b.create<arith::ConstantOp>(type, DenseFPElementsAttr::get(type, imag))};
 }
 
+// Given appropriately shuffled and scaled real and imaginary tensors,
+// run an FFT of size `fftLength`.
 static SmallVector<Value> generateFFT(ImplicitLocOpBuilder &b,
                                       int64_t fftLength,
                                       FFTDirection direction,
