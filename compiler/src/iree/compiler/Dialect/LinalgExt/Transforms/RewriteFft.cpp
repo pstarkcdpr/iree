@@ -59,8 +59,8 @@ static SmallVector<Value> getBitReversalOrder(ImplicitLocOpBuilder &b,
   SmallVector<utils::IteratorType> iterTypes(rank,
                                              utils::IteratorType::parallel);
 
-  Value zero = b.create<arith::ConstantOp>(realElementType,
-      b.getFloatAttr(realElementType, 0.0));
+  Value zero = b.create<arith::ConstantOp>(
+    b.getLoc(), b.getZeroAttr(realElementType));
 
   Value indices = getBitReversalBuffer(b, fftLength);
   auto genericOp = b.create<linalg::GenericOp>(
