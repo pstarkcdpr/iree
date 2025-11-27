@@ -23,6 +23,7 @@
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Transforms/Transforms.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
+#include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -683,7 +684,8 @@ struct ConvertStableHloToLinalgExt final
         .insert<IREE::LinalgExt::IREELinalgExtDialect, linalg::LinalgDialect,
                 IREE::Flow::FlowDialect, mlir::cf::ControlFlowDialect,
                 mlir::math::MathDialect, mlir::arith::ArithDialect,
-                complex::ComplexDialect, tensor::TensorDialect>();
+                complex::ComplexDialect, tensor::TensorDialect,
+                IREE::Util::UtilDialect>();
   }
 
   void runOnOperation() override {
@@ -699,7 +701,8 @@ struct ConvertStableHloToLinalgExt final
                            linalg::LinalgDialect, IREE::Flow::FlowDialect,
                            mlir::cf::ControlFlowDialect,
                            mlir::math::MathDialect, mlir::arith::ArithDialect,
-                           tensor::TensorDialect, complex::ComplexDialect>();
+                           tensor::TensorDialect, complex::ComplexDialect,
+                           IREE::Util::UtilDialect>();
     // TODO: Scatter is not marked as illegal to allow falling back to the
     // generic LinAlg lowering, the generic lowering is not always performant
     // and even though only used in fallback here, may hide performance
