@@ -23,6 +23,7 @@
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Transforms/Transforms.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
+#include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -314,26 +315,53 @@ struct FftOpConversion final : OpConversionPattern<mlir::stablehlo::FftOp> {
   LogicalResult
   matchAndRewrite(mlir::stablehlo::FftOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // Only handle 2^n fft length.
-    if (!llvm::all_equal(op.getFftLength())) {
-      return rewriter.notifyMatchFailure(op, "non-splat length");
+
+    // Only handle 1D ffts.
+    if (op.getFftLength().size() != 1) {
+      return rewriter.notifyMatchFailure(op, "only 1D FFTs supported");
     }
     int64_t fftLength = op.getFftLength().front();
     if (!llvm::isPowerOf2_64(fftLength)) {
       return rewriter.notifyMatchFailure(
           op, "expected FFT length to be a power of two");
     }
+    mlir::stablehlo::FftType fftType = op.getFftType();
+    FailureOr<std::pair<Value, Value>> rewriteRes;
+    if (fftType == mlir::stablehlo::FftType::RFFT) {
+      rewriteRes = IREE::LinalgExt::rewriteRfft(op, adaptor.getOperand(),
+                                                fftLength, rewriter);
+    } else if (fftType == mlir::stablehlo::FftType::FFT) {
+      rewriteRes = IREE::LinalgExt::rewriteFft(
+          op, adaptor.getOperand(), fftLength,
+          IREE::LinalgExt::FFTDirection::Forward,
+          IREE::LinalgExt::FFTNormalization::NoNormalize, rewriter);
+    } else if (fftType == mlir::stablehlo::FftType::IFFT) {
+      rewriteRes = IREE::LinalgExt::rewriteFft(
+          op, adaptor.getOperand(), fftLength,
+          IREE::LinalgExt::FFTDirection::Backward,
+          IREE::LinalgExt::FFTNormalization::Normalize, rewriter);
+    } else if (fftType == mlir::stablehlo::FftType::IRFFT) {
+      rewriteRes = IREE::LinalgExt::rewriteIrfft(op, adaptor.getOperand(),
+                                                 fftLength, rewriter);
+    } else {
+      // Not implemented.
+      return failure();
+    }
 
-    auto rewriteRes = IREE::LinalgExt::rewriteFft(op, adaptor.getOperand(),
-                                                  fftLength, rewriter);
     if (failed(rewriteRes)) {
       return failure();
     }
 
     auto [real, imag] = rewriteRes.value();
 
-    rewriter.replaceOpWithNewOp<mlir::stablehlo::ComplexOp>(op, op.getType(),
-                                                            real, imag);
+    // For IRFFT, return only the real part (output is real-valued)
+    if (fftType == mlir::stablehlo::FftType::IRFFT) {
+      rewriter.replaceOp(op, real);
+    } else {
+      // For other FFT types, return complex output
+      rewriter.replaceOpWithNewOp<mlir::stablehlo::ComplexOp>(op, op.getType(),
+                                                              real, imag);
+    }
     return success();
   }
 };
@@ -667,7 +695,8 @@ struct ConvertStableHloToLinalgExt final
         .insert<IREE::LinalgExt::IREELinalgExtDialect, linalg::LinalgDialect,
                 IREE::Flow::FlowDialect, mlir::cf::ControlFlowDialect,
                 mlir::math::MathDialect, mlir::arith::ArithDialect,
-                complex::ComplexDialect, tensor::TensorDialect>();
+                complex::ComplexDialect, tensor::TensorDialect,
+                IREE::Util::UtilDialect>();
   }
 
   void runOnOperation() override {
@@ -683,7 +712,8 @@ struct ConvertStableHloToLinalgExt final
                            linalg::LinalgDialect, IREE::Flow::FlowDialect,
                            mlir::cf::ControlFlowDialect,
                            mlir::math::MathDialect, mlir::arith::ArithDialect,
-                           tensor::TensorDialect, complex::ComplexDialect>();
+                           tensor::TensorDialect, complex::ComplexDialect,
+                           IREE::Util::UtilDialect>();
     // TODO: Scatter is not marked as illegal to allow falling back to the
     // generic LinAlg lowering, the generic lowering is not always performant
     // and even though only used in fallback here, may hide performance
