@@ -6,6 +6,7 @@
 
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Transforms/Transforms.h"
+#include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Complex/IR/Complex.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -359,8 +360,18 @@ FailureOr<std::pair<Value, Value>> rewriteIrfft(Operation *op, Value operand,
   Value expandedInput = expandConjugateSymmetry(b, operand, fftLength);
 
   // Now perform a normalized backward FFT on the expanded input
-  return rewriteFft(op, expandedInput, fftLength, FFTDirection::Backward,
-                    FFTNormalization::Normalize, rewriter);
+  SmallVector<Value> inputs =
+    getBitReversalOrderComplex(b, expandedInput, fftLength,
+                               true, 1.0 / (double) fftLength);
+
+  SmallVector<Value> results = generateFFT(b, fftLength,
+                                           FFTDirection::Backward,
+                                           inputs);
+
+  // The calling code has no reason to use the imaginary part of the output,
+  // so put an optimization barrier on it to avoid it getting marked readonly.
+  Util::OptimizationBarrierOp::create(b, results[1]);
+  return std::make_pair(results[0], results[1]);
 }
 
 } // namespace mlir::iree_compiler::IREE::LinalgExt

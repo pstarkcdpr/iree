@@ -22,6 +22,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/RegionUtils.h"
 
@@ -38,8 +39,14 @@ namespace {
 // --iree-hal-outline-memoize-regions
 //===----------------------------------------------------------------------===//
 
+static std::atomic<uint32_t> sHackCounter { 0 };
 static std::string getMemoizeNamePrefix(IREE::HAL::DeviceMemoizeOp memoizeOp) {
   auto parentOp = memoizeOp->getParentOfType<FunctionOpInterface>();
+  if (!parentOp.getOperation()->hasAttr(SymbolTable::getSymbolAttrName()))
+  {
+      uint32_t index = sHackCounter.fetch_add(1, std::memory_order_relaxed);
+      parentOp.setName(std::string("_Unnamed_symbol_") + std::to_string(index));
+  }
   return ("__" + parentOp.getName() + "_memoize").str();
 }
 
