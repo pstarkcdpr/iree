@@ -1,0 +1,114 @@
+diff --git third_party/llvm-project/mlir/lib/Dialect/Vector/Transforms/LowerVectorGather.cpp third_party/llvm-project/mlir/lib/Dialect/Vector/Transforms/LowerVectorGather.cpp
+index 3000204c8..29c9d6f96 100644
+--- third_party/llvm-project/mlir/lib/Dialect/Vector/Transforms/LowerVectorGather.cpp
++++ third_party/llvm-project/mlir/lib/Dialect/Vector/Transforms/LowerVectorGather.cpp
+@@ -183,9 +183,40 @@ struct RemoveStrideFromGatherSource : OpRewritePattern<vector::GatherOp> {
+   }
+ };
+ 
++/// Returns true only if the given memref type is provably contiguous (dense
++/// row-major layout). Returns false if non-contiguous or if contiguity cannot
++/// be determined (e.g., dynamic dimensions/strides).
++static bool isContiguousMemRef(MemRefType memType) {
++  // Identity (default) layout is always dense row-major.
++  if (memType.getLayout().isIdentity())
++    return true;
++
++  // For explicit layouts, check if strides match contiguous.
++  SmallVector<int64_t> strides;
++  int64_t offset;
++  if (failed(memType.getStridesAndOffset(strides, offset)))
++    return false; // Can't determine strides; assume non-contiguous.
++
++  int64_t expectedStride = 1;
++  for (int64_t d = memType.getRank() - 1; d >= 0; --d) {
++    int64_t dimSize = memType.getDimSize(d);
++    if (ShapedType::isDynamic(dimSize) || ShapedType::isDynamic(strides[d]))
++      return false; // Can't prove contiguous; assume non-contiguous.
++    if (strides[d] != expectedStride)
++      return false;
++    expectedStride *= dimSize;
++  }
++  return true;
++}
+ /// Turns 1-d `vector.gather` into a scalarized sequence of `vector.loads` or
+ /// `tensor.extract`s. To avoid out-of-bounds memory accesses, these
+ /// loads/extracts are made conditional using `scf.if` ops.
++///
++/// When the source memref has a non-identity layout (e.g., from a
++/// `memref.subview`), the gather index is combined with the base offsets via
++/// linearize-then-delinearize to produce correct N-D load indices:
++///   flatIdx = linearize(baseOffsets) + gatherIndex
++///   loadIndices = delinearize(flatIdx, memrefShape)
+ struct Gather1DToConditionalLoads : OpRewritePattern<vector::GatherOp> {
+   using OpRewritePattern::OpRewritePattern;
+ 
+@@ -206,15 +237,21 @@ struct Gather1DToConditionalLoads : OpRewritePattern<vector::GatherOp> {
+     Value condMask = op.getMask();
+     Value base = op.getBase();
+ 
+-    // vector.load requires the most minor memref dim to have unit stride
+-    // (unless reading exactly 1 element)
++    // Check if the source memref has a non-identity layout, requiring
++    // linearize/delinearize to compute correct N-D load indices.
++    bool needsDelinearization = false;
+     if (auto memType = dyn_cast<MemRefType>(base.getType())) {
++      // vector.load requires the most minor memref dim to have unit stride
++      // (unless reading exactly 1 element).
+       if (auto stridesAttr =
+               dyn_cast_if_present<StridedLayoutAttr>(memType.getLayout())) {
+         if (stridesAttr.getStrides().back() != 1 &&
+             resultTy.getNumElements() != 1)
+           return failure();
+       }
++
++      if (memType.getRank() > 1 && !isContiguousMemRef(memType))
++        needsDelinearization = true;
+     }
+ 
+     Value indexVec = rewriter.createOrFold<arith::IndexCastOp>(
+@@ -223,7 +260,18 @@ struct Gather1DToConditionalLoads : OpRewritePattern<vector::GatherOp> {
+     auto baseOffsets = llvm::to_vector(op.getIndices());
+     Value lastBaseOffset = baseOffsets.back();
+ 
++    // Compute the basis (memref shape) and linearized base offset once,
++    // outside the per-element loop.
++    SmallVector<OpFoldResult> basis;
++    Value linearizedBase;
++    if (needsDelinearization) {
++      basis = memref::getMixedSizes(rewriter, loc, base);
++      linearizedBase = rewriter.create<affine::AffineLinearizeIndexOp>(
++          loc, baseOffsets, basis, /*disjoint=*/false);
++    }
++
+     Value result = op.getPassThru();
++    BoolAttr nontemporalAttr = nullptr;
+ 
+     // Emit a conditional access for each vector element.
+     for (int64_t i = 0, e = resultTy.getNumElements(); i < e; ++i) {
+@@ -231,8 +279,23 @@ struct Gather1DToConditionalLoads : OpRewritePattern<vector::GatherOp> {
+       Value condition =
+           rewriter.create<vector::ExtractOp>(loc, condMask, thisIdx);
+       Value index = rewriter.create<vector::ExtractOp>(loc, indexVec, thisIdx);
+-      baseOffsets.back() =
+-          rewriter.createOrFold<arith::AddIOp>(loc, lastBaseOffset, index);
++
++      if (needsDelinearization) {
++        // The gather index offsets the innermost dimension. Combine with
++        // the base offsets by linearizing, adding the gather index, then
++        // delinearizing back to N-D indices:
++        //   flatIdx = linearize(baseOffsets, shape) + gatherIndex
++        //   loadIndices = delinearize(flatIdx, shape)
++        Value flatIdx =
++            rewriter.createOrFold<arith::AddIOp>(loc, linearizedBase, index);
++        auto delinOp = rewriter.create<affine::AffineDelinearizeIndexOp>(
++            loc, flatIdx, basis, /*hasOuterBound=*/true);
++        for (int64_t d = 0, rank = baseOffsets.size(); d < rank; ++d)
++          baseOffsets[d] = delinOp.getResult(d);
++      } else {
++        baseOffsets.back() =
++            rewriter.createOrFold<arith::AddIOp>(loc, lastBaseOffset, index);
++      }
+ 
+       auto loadBuilder = [&](OpBuilder &b, Location loc) {
+         Value extracted;

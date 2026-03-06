@@ -1,0 +1,24 @@
+diff --git third_party/stablehlo/stablehlo/conversions/linalg/transforms/StablehloToLinalgConvolution.cpp third_party/stablehlo/stablehlo/conversions/linalg/transforms/StablehloToLinalgConvolution.cpp
+index b246227..5e588f2 100644
+--- third_party/stablehlo/stablehlo/conversions/linalg/transforms/StablehloToLinalgConvolution.cpp
++++ third_party/stablehlo/stablehlo/conversions/linalg/transforms/StablehloToLinalgConvolution.cpp
+@@ -246,10 +246,15 @@ struct NormalConvolutionOpConversion final
+         loc, resultType.getShape(), resultType.getElementType(), dynSizes);
+     Value zeroTensor = fillTensorWithZeros(rewriter, loc, emptyTensor);
+     linalg::LinalgOp res;
+-    Attribute strides;
+-    if (auto s = op.getWindowStrides()) strides = rewriter.getI64TensorAttr(*s);
+-    Attribute dilations;
+-    if (auto d = op.getRhsDilation()) dilations = rewriter.getI64TensorAttr(*d);
++    auto s = op.getWindowStrides();
++    Attribute strides =
++        s ? rewriter.getI64TensorAttr(*s)
++          : rewriter.getI64TensorAttr(SmallVector<int64_t>(rank - 2, 1));
++
++    auto d = op.getRhsDilation();
++    Attribute dilations =
++        d ? rewriter.getI64TensorAttr(*d)
++          : rewriter.getI64TensorAttr(SmallVector<int64_t>(rank - 2, 1));
+ 
+     // Apply padding and input dilation.
+     llvm::SmallVector<int64_t> spatialDimMapping(rank - 2);
