@@ -1,7 +1,12 @@
-diff --git third_party/llvm-project/mlir/lib/Dialect/Vector/Transforms/LowerVectorGather.cpp third_party/llvm-project/mlir/lib/Dialect/Vector/Transforms/LowerVectorGather.cpp
+# Submodule: third_party/llvm-project
+# Generated: 2026-03-31T20:29:54Z
+# Path:      /home/pstark/gitlab/iree-custom/iree-org/iree/third_party/llvm-project
+
+## Uncommitted changes ##
+diff --git a/third_party/llvm-project/mlir/lib/Dialect/Vector/Transforms/LowerVectorGather.cpp b/third_party/llvm-project/mlir/lib/Dialect/Vector/Transforms/LowerVectorGather.cpp
 index 3000204c8..5107ca2fa 100644
---- third_party/llvm-project/mlir/lib/Dialect/Vector/Transforms/LowerVectorGather.cpp
-+++ third_party/llvm-project/mlir/lib/Dialect/Vector/Transforms/LowerVectorGather.cpp
+--- a/third_party/llvm-project/mlir/lib/Dialect/Vector/Transforms/LowerVectorGather.cpp
++++ b/third_party/llvm-project/mlir/lib/Dialect/Vector/Transforms/LowerVectorGather.cpp
 @@ -186,6 +186,11 @@ struct RemoveStrideFromGatherSource : OpRewritePattern<vector::GatherOp> {
  /// Turns 1-d `vector.gather` into a scalarized sequence of `vector.loads` or
  /// `tensor.extract`s. To avoid out-of-bounds memory accesses, these
@@ -83,3 +88,4 @@ index 3000204c8..5107ca2fa 100644
  
        auto loadBuilder = [&](OpBuilder &b, Location loc) {
          Value extracted;
+
