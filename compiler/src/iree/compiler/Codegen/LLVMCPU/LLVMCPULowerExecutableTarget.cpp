@@ -100,9 +100,7 @@ void LLVMCPULowerExecutableTargetPass::runOnOperation() {
   pipelineOpts.decomposePackUnPackOps =
       isOptEnabled(funcOp, getEnableDecompositionStr());
   pipelineOpts.lowerToAVX2 = hasAVX2Feature(target);
-  pipelineOpts.enableVectorMasking =
-      isX86(target) || isRISCV(target) ||
-      (isAArch64(target) && hasAnySVEFeature(target));
+  pipelineOpts.enableVectorMasking = false;
   pipelineOpts.enableAArch64SME =
       isAArch64(target) && hasAnySVEFeature(target) && hasSMEFeature(target);
   pipelineOpts.enableAArch64I8mm = isAArch64(target) && hasI8mmFeature(target);
