@@ -103,11 +103,11 @@ static iree_status_t iree_hal_module_buffer_view_trace_npy(
 
   for (iree_host_size_t i = 0; i < buffer_view_count; ++i) {
     // Build the output path: <trace_dir>/<call_index>_<key>_<i>.npy
-    char file_path[2048];
+    char file_path[IREE_MAX_PATH + 1];
     int path_len =
         snprintf(file_path, sizeof(file_path), "%s/%" PRIhsz "_%s_%" PRIhsz ".npy",
                  state->trace_dir, state->call_index, sanitized_key, i);
-    if (path_len <= 0 || (iree_host_size_t)path_len >= sizeof(file_path)) {
+    if (path_len <= 0 || path_len > IREE_MAX_PATH) {
       return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED,
                               "trace npy file path too long");
     }
