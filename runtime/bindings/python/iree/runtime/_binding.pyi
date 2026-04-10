@@ -18,6 +18,7 @@ def create_hal_module(
     device: Optional[HalDevice] = None,
     devices: Optional[List[HalDevice]] = None,
     debug_sink: Optional[HalModuleDebugSink] = None,
+    trace_dir: Optional[str] = None,
 ) -> VmModule: ...
 def create_io_parameters_module(
     instance: VmInstance, *providers: ParameterProvider
