@@ -170,6 +170,15 @@ iree_status_t iree_tooling_load_modules_from_flags(
 // HAL module device selection policy
 //===----------------------------------------------------------------------===//
 
+IREE_FLAG(
+    string, trace_dir, "",
+    "Directory to write per-dispatch tensor traces as NumPy .npy files.\n"
+    "When set, each dispatch tensor trace (produced by the compiler flag\n"
+    "--iree-flow-trace-dispatch-tensors) writes individual .npy files to\n"
+    "this directory instead of printing to stderr. File names take the form:\n"
+    "  <call_index>_<sanitized_key>_<buffer_index>.npy\n"
+    "The directory must already exist before running.");
+
 IREE_FLAG(int32_t, device_lead_allocator, 0,
           "Device ordinal of the lead device that will be used for allocations "
           "when more than one device is available. Only functions when there "
@@ -278,14 +287,24 @@ static iree_status_t iree_tooling_load_hal_async_module(
         &group_builder, host_allocator, &device_group);
   }
 
+  // Select debug sink: npy files when --trace-dir is set, otherwise stderr.
+  iree_hal_module_debug_sink_t debug_sink = iree_hal_module_debug_sink_null();
+  if (iree_status_is_ok(status)) {
+    if (strlen(FLAG_trace_dir) > 0) {
+      status = iree_hal_module_debug_sink_npy(
+          iree_make_cstring_view(FLAG_trace_dir), host_allocator, &debug_sink);
+    } else {
+      debug_sink = iree_hal_module_debug_sink_stdio(stderr);
+    }
+  }
+
   // Create HAL module wrapping the device group.
   iree_hal_module_flags_t flags = IREE_HAL_MODULE_FLAG_NONE;
   iree_vm_module_t* module = NULL;
   if (iree_status_is_ok(status)) {
     status = iree_hal_module_create(
         instance, iree_hal_module_device_policy_from_flags(device_list),
-        device_group, flags, iree_hal_module_debug_sink_stdio(stderr),
-        host_allocator, &module);
+        device_group, flags, debug_sink, host_allocator, &module);
   }
   iree_hal_device_group_release(device_group);
 
@@ -296,6 +315,11 @@ static iree_status_t iree_tooling_load_hal_async_module(
     *out_device = device;
     *out_device_allocator = device_allocator;
   } else {
+    // If the module was not created, release the debug sink since the module
+    // did not take ownership of it.
+    if (!module && debug_sink.release.fn) {
+      debug_sink.release.fn(debug_sink.release.user_data);
+    }
     iree_hal_allocator_release(device_allocator);
     iree_hal_device_release(device);
     iree_vm_module_release(module);
@@ -342,18 +366,35 @@ static iree_status_t iree_tooling_load_hal_inline_module(
       z0, iree_tooling_create_inline_device_allocator_from_flags(
               host_allocator, &device_allocator));
 
+  // Select debug sink: npy files when --trace-dir is set, otherwise stderr.
+  iree_hal_module_debug_sink_t debug_sink;
+  iree_status_t status = iree_ok_status();
+  if (strlen(FLAG_trace_dir) > 0) {
+    status = iree_hal_module_debug_sink_npy(
+        iree_make_cstring_view(FLAG_trace_dir), host_allocator, &debug_sink);
+  } else {
+    debug_sink = iree_hal_module_debug_sink_stdio(stderr);
+  }
+
   // Create the module; it's immutable and can be reused but we don't do that in
   // this tooling.
   iree_hal_inline_module_flags_t flags = IREE_HAL_INLINE_MODULE_FLAG_NONE;
   iree_vm_module_t* module = NULL;
-  iree_status_t status = iree_hal_inline_module_create(
-      instance, flags, iree_hal_module_debug_sink_stdio(stderr),
-      device_allocator, host_allocator, &module);
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_inline_module_create(instance, flags, debug_sink,
+                                           device_allocator, host_allocator,
+                                           &module);
+  }
 
   if (iree_status_is_ok(status)) {
     *out_module = module;
     *out_device_allocator = device_allocator;
   } else {
+    // If the module was not created, release the debug sink since the module
+    // did not take ownership of it.
+    if (!module && debug_sink.release.fn) {
+      debug_sink.release.fn(debug_sink.release.user_data);
+    }
     iree_hal_allocator_release(device_allocator);
     iree_vm_module_release(module);
   }
