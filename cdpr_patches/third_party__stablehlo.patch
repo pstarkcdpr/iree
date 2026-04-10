@@ -1,6 +1,5 @@
 # Submodule: third_party/stablehlo
-# Generated: 2026-03-31T20:29:54Z
-# Path:      /home/pstark/gitlab/iree-custom/iree-org/iree/third_party/stablehlo
+# Generated: 2026-04-10T18:42:46Z
 
 ## Uncommitted changes ##
 diff --git a/third_party/stablehlo/stablehlo/conversions/linalg/transforms/StablehloToLinalgConvolution.cpp b/third_party/stablehlo/stablehlo/conversions/linalg/transforms/StablehloToLinalgConvolution.cpp
