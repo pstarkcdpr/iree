@@ -394,10 +394,15 @@ set(_dylib_src_files)
 foreach (_dylib_relpath ${_dylib_relpaths})
   set(_dylib_srcpath "${IREE_COMPILER_DYLIB_DIR}/${_dylib_relpath}")
   set(_dylib_outputpath "${_PYTHON_BUILD_PREFIX}/iree/compiler/_mlir_libs/${_dylib_relpath}")
+  if(WIN32)
+    set(_LINK_OR_COPY copy_if_different)
+  else()
+    set(_LINK_OR_COPY create_symlink)
+  endif()
   cmake_path(GET _dylib_outputpath PARENT_PATH _parent_dir)
   file(MAKE_DIRECTORY "${_parent_dir}")
   list(APPEND _dylib_copy_commands
-    COMMAND ${CMAKE_COMMAND} -E create_symlink
+    COMMAND ${CMAKE_COMMAND} -E ${_LINK_OR_COPY}
       "${_dylib_srcpath}" "${_dylib_outputpath}"
   )
   list(APPEND _dylib_target_files "${_dylib_outputpath}")
