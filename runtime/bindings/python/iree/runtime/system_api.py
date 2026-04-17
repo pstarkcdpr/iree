@@ -59,6 +59,7 @@ class Config:
         driver_name: Optional[str] = None,
         *,
         device: Optional[_binding.HalDevice] = None,
+        trace_dir: Optional[str] = None,
     ):
         # Either use an explicit device or auto config based on driver names.
         if device is not None and driver_name is not None:
@@ -73,7 +74,9 @@ class Config:
             )
 
         self.vm_instance = _binding.VmInstance()
-        hal_module = _binding.create_hal_module(self.vm_instance, self.device)
+        hal_module = _binding.create_hal_module(
+            self.vm_instance, self.device, trace_dir=trace_dir
+        )
         self.default_vm_modules = (hal_module,)
 
 
