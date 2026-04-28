@@ -593,6 +593,11 @@ function(iree_symlink_tool)
   set(_TO_TOOL_PATH "${CMAKE_CURRENT_BINARY_DIR}/${_RULE_TO_EXE_NAME}${CMAKE_EXECUTABLE_SUFFIX}")
   get_filename_component(_TO_TOOL_DIR "${_TO_TOOL_PATH}" DIRECTORY)
 
+  if(WIN32)
+    set(_LINK_OR_COPY copy_if_different)
+  else()
+    set(_LINK_OR_COPY create_symlink)
+  endif()
   add_custom_command(
     TARGET "${_TARGET}"
     POST_BUILD
@@ -601,7 +606,7 @@ function(iree_symlink_tool)
     COMMAND
       ${CMAKE_COMMAND} -E make_directory "${_TO_TOOL_DIR}"
     COMMAND
-      ${CMAKE_COMMAND} -E create_symlink
+      ${CMAKE_COMMAND} -E ${_LINK_OR_COPY}
         "$<TARGET_FILE:${_FROM_TOOL_TARGET}>"
         "${_TO_TOOL_PATH}"
   )
