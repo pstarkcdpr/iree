@@ -1,0 +1,36 @@
+# Submodule: third_party/stablehlo
+# Generated: 2026-04-08T23:19:36Z
+
+## Uncommitted changes ##
+diff --git a/third_party/stablehlo/stablehlo/tools/StablehloTranslateMain.cpp b/third_party/stablehlo/stablehlo/tools/StablehloTranslateMain.cpp
+index fdf0d6a..5bab7f7 100644
+--- a/third_party/stablehlo/stablehlo/tools/StablehloTranslateMain.cpp
++++ b/third_party/stablehlo/stablehlo/tools/StablehloTranslateMain.cpp
+@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
+ limitations under the License.
+ ==============================================================================*/
+ 
++#include <iostream>
++#include <fstream>
+ #include <memory>
+ #include <string>
+ #include <utility>
+@@ -111,6 +113,17 @@ parseInterpreterArguments(std::string argsStr, MLIRContext *context) {
+     return emitError(UnknownLoc::get(context), msg) << ", i.e. " << usage;
+   };
+   if (!argsStr.empty()) {
++    if (argsStr[0] == '@') {
++      printf("Loading file\n");
++      std::ifstream tmp_stream(argsStr.substr(1));
++      if (!tmp_stream.is_open()) {
++        return parseError("failed to input argument file");
++      }
++      argsStr = std::string((std::istreambuf_iterator<char>(tmp_stream)),
++                                        std::istreambuf_iterator<char>());
++      printf("Loaded\n");
++      puts(argsStr.c_str());
++    }
+     auto arrayAttr =
+         dyn_cast_or_null<ArrayAttr>(mlir::parseAttribute(argsStr, context));
+     if (!arrayAttr) {
+
