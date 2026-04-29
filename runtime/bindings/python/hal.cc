@@ -1143,11 +1143,17 @@ HalDevice HalDriver::CreateDeviceByURI(std::string& device_uri,
 VmModule CreateHalModule(
     VmInstance* instance, std::optional<HalDevice*> device,
     std::optional<py::list> devices,
-    std::optional<py::ref<HalModuleDebugSink>> debug_sink) {
+    std::optional<py::ref<HalModuleDebugSink>> debug_sink,
+    std::optional<std::string> trace_dir) {
   if (device && devices) {
     PyErr_SetString(
         PyExc_ValueError,
         "\"device\" and \"devices\" are mutually exclusive arguments.");
+  }
+  if (trace_dir && debug_sink) {
+    PyErr_SetString(
+        PyExc_ValueError,
+        "\"trace_dir\" and \"debug_sink\" are mutually exclusive arguments.");
   }
   // Build a device group from the provided device(s).
   iree_hal_device_group_builder_t group_builder;
@@ -1170,10 +1176,18 @@ VmModule CreateHalModule(
                      &group_builder, iree_allocator_system(), &device_group),
                  "Error creating device group");
 
-  iree_hal_module_debug_sink_t iree_hal_module_debug_sink =
-      iree_hal_module_debug_sink_stdio(stderr);
-  if (debug_sink) {
+  iree_hal_module_debug_sink_t iree_hal_module_debug_sink;
+  memset(&iree_hal_module_debug_sink, 0, sizeof(iree_hal_module_debug_sink));
+  if (trace_dir) {
+    CheckApiStatus(
+        iree_hal_module_debug_sink_npy(
+            iree_make_cstring_view(trace_dir->c_str()),
+            iree_allocator_system(), &iree_hal_module_debug_sink),
+        "Error creating npy debug sink");
+  } else if (debug_sink) {
     iree_hal_module_debug_sink = (*debug_sink)->AsIreeHalModuleDebugSink();
+  } else {
+    iree_hal_module_debug_sink = iree_hal_module_debug_sink_stdio(stderr);
   }
 
   iree_vm_module_t* module = NULL;
@@ -1181,6 +1195,13 @@ VmModule CreateHalModule(
       instance->raw_ptr(), iree_hal_module_device_policy_default(),
       device_group, IREE_HAL_MODULE_FLAG_NONE, iree_hal_module_debug_sink,
       iree_allocator_system(), &module);
+  // If module creation failed and we own a npy sink, release its state since
+  // the module did not take ownership.
+  if (!iree_status_is_ok(status) && trace_dir &&
+      iree_hal_module_debug_sink.release.fn) {
+    iree_hal_module_debug_sink.release.fn(
+        iree_hal_module_debug_sink.release.user_data);
+  }
   iree_hal_device_group_release(device_group);
   CheckApiStatus(status, "Error creating hal module");
   VmModule vm_module = VmModule::StealFromRawPtr(module);
@@ -1308,7 +1329,8 @@ void SetupHalBindings(nanobind::module_ m) {
   // Built-in module creation.
   m.def("create_hal_module", &CreateHalModule, py::arg("instance"),
         py::arg("device") = py::none(), py::arg("devices") = py::none(),
-        py::arg("debug_sink") = py::none());
+        py::arg("debug_sink") = py::none(),
+        py::arg("trace_dir") = py::none());
 
   // Enums.
   py::enum_<enum iree_hal_memory_type_bits_t>(m, "MemoryType")

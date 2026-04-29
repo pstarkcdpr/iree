@@ -59,9 +59,24 @@ iree_hal_module_debug_sink_null(void);
 IREE_API_EXPORT iree_hal_module_debug_sink_t
 iree_hal_module_debug_sink_stdio(FILE* file);
 
+// Returns a debug sink that writes each dispatch buffer view to a .npy file
+// under |trace_dir|. File names take the form:
+//   <call_index>_<sanitized_key>_<buffer_index>.npy
+// where <call_index> is a monotonically-increasing counter across all trace
+// events and non-alphanumeric characters in the key are replaced with '_'.
+// The directory must already exist; an error is returned if a file cannot be
+// opened. The sink state is heap-allocated and freed via the release callback.
+IREE_API_EXPORT iree_status_t
+iree_hal_module_debug_sink_npy(iree_string_view_t trace_dir,
+                                iree_allocator_t host_allocator,
+                                iree_hal_module_debug_sink_t* out_sink);
+
 #else
 
 #define iree_hal_module_debug_sink_stdio(file) iree_hal_module_debug_sink_null()
+
+#define iree_hal_module_debug_sink_npy(trace_dir, host_allocator, out_sink) \
+  (*(out_sink) = iree_hal_module_debug_sink_null(), iree_ok_status())
 
 #endif  // IREE_FILE_IO_ENABLE
 

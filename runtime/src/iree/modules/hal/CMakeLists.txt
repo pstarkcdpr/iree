@@ -20,6 +20,8 @@ iree_cc_library(
   DEPS
     iree::base
     iree::hal
+    iree::io::stream
+    iree::tooling::numpy_io
     iree::vm
   PUBLIC
 )
