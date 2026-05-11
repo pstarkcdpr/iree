@@ -1137,10 +1137,10 @@ setMatmulLoweringConfig(IREE::GPU::TargetAttr target,
                             workgroupSize, targetSubgroupSize, pipelineConfig));
 }
 
-/// Helper to identify contraction like operations for operand promotiong.
+/// Helper to identify contraction-like operations for operand promotion.
 static bool isNonMatvecContraction(Operation *op) {
   auto linalgOp = dyn_cast<linalg::LinalgOp>(op);
-  if (!linalgOp) {
+  if (!linalgOp || !linalg::isaContractionOpInterface(linalgOp)) {
     return false;
   }
   SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
