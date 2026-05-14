@@ -9,6 +9,7 @@
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/IndexingUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
+#include "llvm/ADT/Repeated.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
@@ -703,7 +704,7 @@ void MapLoadOp::insertTransformationAtStart(
     int64_t numOutputIndices) {
   Block &transformBody = getTransformationRegion().front();
   SmallVector<BlockArgument> oldOutputIndices(transformBody.getArguments());
-  SmallVector<Type> indexTypes(numOutputIndices, builder.getIndexType());
+  llvm::Repeated<Type> indexTypes(numOutputIndices, builder.getIndexType());
   SmallVector<Location> locs(numOutputIndices, getLoc());
 
   // Create the new block arguments for the new output indices, and transform
@@ -812,7 +813,7 @@ MapLoadOp MapLoadOp::createIdentityMapLoad(OpBuilder &builder, Location loc,
   Region &region = mapLoadOp.getTransformationRegion();
   auto outputType = cast<ShapedType>(output.getType());
   SmallVector<Location> blockArgLocs(outputType.getRank(), loc);
-  SmallVector<Type> indexTypes(outputType.getRank(), builder.getIndexType());
+  llvm::Repeated<Type> indexTypes(outputType.getRank(), builder.getIndexType());
   OpBuilder::InsertionGuard guard(builder);
   Block *block =
       builder.createBlock(&region, region.end(), indexTypes, blockArgLocs);
@@ -847,7 +848,7 @@ MapStoreOp MapStoreOp::createIdentityMapStore(OpBuilder &builder, Location loc,
   Region &region = mapStoreOp.getTransformationRegion();
   auto inputType = cast<ShapedType>(input.getType());
   SmallVector<Location> blockArgLocs(inputType.getRank(), loc);
-  SmallVector<Type> indexTypes(inputType.getRank(), builder.getIndexType());
+  llvm::Repeated<Type> indexTypes(inputType.getRank(), builder.getIndexType());
   OpBuilder::InsertionGuard guard(builder);
   Block *block =
       builder.createBlock(&region, region.end(), indexTypes, blockArgLocs);
@@ -928,7 +929,7 @@ void MapStoreOp::insertTransformationAtStart(
     int64_t numSourceIndices) {
   Block &transformBody = getTransformationRegion().front();
   SmallVector<BlockArgument> oldSourceIndices(transformBody.getArguments());
-  SmallVector<Type> indexTypes(numSourceIndices, builder.getIndexType());
+  llvm::Repeated<Type> indexTypes(numSourceIndices, builder.getIndexType());
   SmallVector<Location> locs(numSourceIndices, getLoc());
 
   // Create the new block arguments for the new source indices, and transform
@@ -2144,7 +2145,18 @@ void OnlineAttentionOp::build(OpBuilder &odsBuilder, OperationState &odsState,
                               std::optional<Value> mask) {
   Value maskIn = mask.value_or(Value());
   build(odsBuilder, odsState, results, query, key, value, scale, maskIn, output,
-        max, sum, indexingMaps, DictionaryAttr::get(odsBuilder.getContext()));
+        max, sum, indexingMaps, DictionaryAttr());
+}
+
+void OnlineAttentionOp::build(OpBuilder &odsBuilder, OperationState &odsState,
+                              TypeRange results, ValueRange inputOperands,
+                              ValueRange initOperands, ArrayAttr indexingMaps) {
+  assert(inputOperands.size() < 6);
+  assert(initOperands.size() == 3);
+  Value mask = inputOperands.size() > 4 ? inputOperands[4] : Value();
+  build(odsBuilder, odsState, results, inputOperands[0], inputOperands[1],
+        inputOperands[2], inputOperands[3], mask, initOperands[0],
+        initOperands[1], initOperands[2], indexingMaps, DictionaryAttr());
 }
 
 LogicalResult OnlineAttentionOp::verify() {
