@@ -1,0 +1,90 @@
+# Submodule: third_party/llvm-project
+# Generated: 2026-06-26T21:35:53Z
+
+## Uncommitted changes ##
+diff --git a/third_party/llvm-project/mlir/lib/Dialect/Linalg/Transforms/Vectorization.cpp b/third_party/llvm-project/mlir/lib/Dialect/Linalg/Transforms/Vectorization.cpp
+index b57e66a1c..3f9d19f57 100644
+--- a/third_party/llvm-project/mlir/lib/Dialect/Linalg/Transforms/Vectorization.cpp
++++ b/third_party/llvm-project/mlir/lib/Dialect/Linalg/Transforms/Vectorization.cpp
+@@ -1299,9 +1299,22 @@ vectorizeTensorExtract(RewriterBase &rewriter, VectorizationState &state,
+       rewriter, loc, resultType, extractOp.getTensor(), transferReadIdxs,
+       /*padding=*/std::nullopt, permutationMap, inBounds);
+ 
++  // Mask this contiguous xfer_read here rather than relying on the generic
++  // path (the generic path assumes an identity masking map over all the loop
++  // dims, which wouldn't be valid here). A contiguous load only reads the
++  // trailing `min(dstRank, srcRank)` dims of the iteration space - the leading
++  // dims are broadcast via `permutationMap` above - so its inferred mask is
++  // rank-reduced. Build a masking map that projects the iteration space onto
++  // exactly those trailing dims so the created mask matches the xfer_read.
++  int64_t numReadDims = std::min(dstRank, srcRank);
++  auto maskingMap = AffineMap::getMinorIdentityMap(
++      linalgOp.getNumLoops(), numReadDims, rewriter.getContext());
++  Operation *maskedReadOp =
++      state.maskOperation(rewriter, transferReadOp, linalgOp, maskingMap);
++
+   LDBG() << "Vectorised as contiguous load: " << extractOp;
+   return VectorizationHookResult{VectorizationHookStatus::NewOp,
+-                                 transferReadOp};
++                                 maskedReadOp};
+ }
+ 
+ /// Emit reduction operations if the shapes of the value to reduce is different
+diff --git a/third_party/llvm-project/mlir/test/Dialect/Linalg/vectorization/extract.mlir b/third_party/llvm-project/mlir/test/Dialect/Linalg/vectorization/extract.mlir
+index 76ac4b839..fc0a11ef9 100644
+--- a/third_party/llvm-project/mlir/test/Dialect/Linalg/vectorization/extract.mlir
++++ b/third_party/llvm-project/mlir/test/Dialect/Linalg/vectorization/extract.mlir
+@@ -477,3 +477,52 @@ module attributes {transform.with_named_sequence} {
+     transform.yield
+   }
+ }
++
++// -----
++
++// A contiguous `tensor.extract` from a source whose rank is *smaller* than the
++// iteration space (here: a 1-D source inside a 2-D loop nest). The contiguous
++// `vector.transfer_read` only reads the trailing (contiguous) dim - the leading
++// dim is broadcast via the permutation map - so its mask must be rank-reduced
++// (`vector<4xi1>`) rather than the full iteration-space mask (`vector<1x4xi1>`).
++// Regression test: previously the full iteration mask was attached, producing
++// an invalid `vector.transfer_read` ("inferred mask type ... don't match").
++
++func.func @masked_contiguous_extract_rank_reducing_mask(
++    %src: tensor<16xf32>,
++    %output : tensor<1x3xf32>,
++    %idx: index) -> tensor<1x3xf32> {
++  %1 = linalg.generic {
++    indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>],
++    iterator_types = ["parallel", "parallel"]
++  } outs(%output : tensor<1x3xf32>) {
++  ^bb0(%out: f32):
++    %2 = linalg.index 1 : index
++    %3 = affine.apply affine_map<(d0, d1) -> (d0 + d1)>(%2, %idx)
++    %extracted = tensor.extract %src[%3] : tensor<16xf32>
++    linalg.yield %extracted : f32
++  } -> tensor<1x3xf32>
++  return %1 : tensor<1x3xf32>
++}
++
++// CHECK-LABEL:   func.func @masked_contiguous_extract_rank_reducing_mask
++// CHECK-SAME:      %[[SRC:.*]]: tensor<16xf32>,
++// CHECK-SAME:      %[[OUTPUT:.*]]: tensor<1x3xf32>,
++// CHECK-SAME:      %[[IDX_IN:.*]]: index) -> tensor<1x3xf32> {
++
++/// Full iteration-space mask (used for the output read/write).
++// CHECK:           %[[MASK_2D:.*]] = vector.create_mask {{.*}} : vector<1x4xi1>
++
++/// The contiguous read of the 1-D source uses a rank-reduced mask.
++// CHECK:           %[[MASK_1D:.*]] = vector.create_mask {{.*}} : vector<4xi1>
++// CHECK:           vector.mask %[[MASK_1D]] {
++// CHECK-SAME:          vector.transfer_read %[[SRC]]{{.*}} {in_bounds = [true, true], permutation_map = {{.*}}} : tensor<16xf32>, vector<1x4xf32>
++// CHECK-SAME:      } : vector<4xi1> -> vector<1x4xf32>
++
++module attributes {transform.with_named_sequence} {
++  transform.named_sequence @__transform_main(%arg1: !transform.any_op {transform.readonly}) {
++     %0 = transform.structured.match ops{["linalg.generic"]} in %arg1 : (!transform.any_op) -> !transform.any_op
++     transform.structured.vectorize %0 vector_sizes [1, 4] {vectorize_nd_extract} : !transform.any_op
++     transform.yield
++   }
++}
+
