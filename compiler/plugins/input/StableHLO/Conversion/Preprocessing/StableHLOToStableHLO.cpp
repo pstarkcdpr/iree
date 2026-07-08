@@ -453,6 +453,18 @@ struct TransposeReshapeGenericDotGeneral final
   }
 };
 
+// The following helpers and the ScatterBatchingDimsExpander pattern below are
+// ported from upstream StableHLO's `ScatterWithBatchingDimsExpander` and its
+// supporting helpers in
+// third_party/stablehlo/stablehlo/transforms/StablehloCompatibilityExpander.cpp
+// (mergeSortedDims / fitsInIntegralType / promoteTypeForSize /
+// getUpdatedIndicesAreSorted / createConcatIndices). They are copied rather than
+// reused because the upstream pattern lives in an anonymous namespace (not
+// exported), and its only public entry point
+// (populateStablehloCompatibilityExpanderPatterns) is a version-gated bundle
+// that would also pull in unrelated compatibility expanders. Check that file for
+// upstream fixes if this code needs updating.
+//
 // Merges two sorted lists of dimensions into a single sorted list.
 SmallVector<int64_t> mergeSortedDims(ArrayRef<int64_t> dims1,
                                      ArrayRef<int64_t> dims2) {
@@ -604,8 +616,8 @@ struct ScatterBatchingDimsExpander final
 //
 // The permutation places the scattered dims first (in index order) followed by
 // the remaining dims in ascending order. Preserving the relative order of the
-// non-scattered (window) dims means `update_window_dims` stay valid and the
-// updates tensor does not need to be transposed.
+// non-scattered (window) dims means `update_window_dims` stays valid and the
+// updated tensor does not need to be transposed.
 struct ScatterOperandDimsToLeading final
     : OpRewritePattern<mlir::stablehlo::ScatterOp> {
   using Base::Base;
