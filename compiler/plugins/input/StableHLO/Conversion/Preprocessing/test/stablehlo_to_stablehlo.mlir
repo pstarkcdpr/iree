@@ -575,23 +575,6 @@ func.func @scatter_update_slice_middle_dim_single_index(
 
 // -----
 
-// A scatter into a non-leading inserted operand dim transposes the operand (and
-// result) so the scattered dim leads, as required by iree_linalg_ext.scatter.
-// CHECK-LABEL: @scatter_operand_dims_to_leading
-func.func @scatter_operand_dims_to_leading(%operand: tensor<8x32x31x4xf32>, %indices: tensor<24x1xi32>, %updates: tensor<8x32x24x4xf32>) -> tensor<8x32x31x4xf32> {
-  // CHECK: %[[T:.+]] = stablehlo.transpose %{{.+}}, dims = [2, 0, 1, 3]
-  // CHECK: %[[S:.+]] = "stablehlo.scatter"(%[[T]],
-  // CHECK-SAME: scatter_dims_to_operand_dims = [0]
-  // CHECK: stablehlo.transpose %[[S]], dims = [1, 2, 0, 3]
-  %0 = "stablehlo.scatter"(%operand, %indices, %updates) <{scatter_dimension_numbers = #stablehlo.scatter<update_window_dims = [0, 1, 3], inserted_window_dims = [2], scatter_dims_to_operand_dims = [2], index_vector_dim = 1>}> ({
-  ^bb0(%a: tensor<f32>, %b: tensor<f32>):
-    stablehlo.return %b : tensor<f32>
-  }) : (tensor<8x32x31x4xf32>, tensor<24x1xi32>, tensor<8x32x24x4xf32>) -> tensor<8x32x31x4xf32>
-  return %0 : tensor<8x32x31x4xf32>
-}
-
-// -----
-
 // CHECK-LABEL: @scatter_i64_indices
 // CHECK: %[[INDICES:.+]] = stablehlo.convert %arg1 : (tensor<1x1xi64>) -> tensor<1x1xi32>
 // CHECK: %[[SCATTER:.+]] = "stablehlo.scatter"(%arg0, %[[INDICES]], %arg2)

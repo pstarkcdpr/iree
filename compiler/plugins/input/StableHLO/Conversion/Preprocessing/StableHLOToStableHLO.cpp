@@ -607,137 +607,6 @@ struct ScatterBatchingDimsExpander final
   }
 };
 
-// Transposes the `original`/result operands of a `stablehlo.scatter` so that the
-// dimensions indexed by the scatter (`scatter_dims_to_operand_dims`) become the
-// leading operand dimensions. IREE's `iree_linalg_ext.scatter` requires the
-// index depth to map to the leading dims of `original` (the update slice must be
-// the trailing dims); scatters that index into interior/trailing operand dims
-// otherwise lower to an invalid `dimension_map`.
-//
-// The permutation places the scattered dims first (in index order) followed by
-// the remaining dims in ascending order. Preserving the relative order of the
-// non-scattered (window) dims means `update_window_dims` stays valid and the
-// updated tensor does not need to be transposed.
-struct ScatterOperandDimsToLeading final
-    : OpRewritePattern<mlir::stablehlo::ScatterOp> {
-  using Base::Base;
-
-  LogicalResult matchAndRewrite(mlir::stablehlo::ScatterOp op,
-                                PatternRewriter &rewriter) const override {
-    auto dimNumbers = op.getScatterDimensionNumbers();
-
-    // Batching dims must be lowered first (see ScatterBatchingDimsExpander).
-    if (!dimNumbers.getInputBatchingDims().empty()) {
-      return rewriter.notifyMatchFailure(op, "scatter still has batching dims");
-    }
-
-    ArrayRef<int64_t> scatterDimsToOperandDims =
-        dimNumbers.getScatterDimsToOperandDims();
-    auto operandTy = dyn_cast<RankedTensorType>(op.getInputs().front().getType());
-    if (!operandTy) {
-      return rewriter.notifyMatchFailure(op, "operand has no rank");
-    }
-    int64_t rank = operandTy.getRank();
-
-    // Already leading: scatter_dims_to_operand_dims == [0, 1, ..., k-1].
-    bool isLeading = true;
-    for (auto [idx, dim] : llvm::enumerate(scatterDimsToOperandDims)) {
-      if (static_cast<int64_t>(idx) != dim) {
-        isLeading = false;
-        break;
-      }
-    }
-    if (isLeading) {
-      return rewriter.notifyMatchFailure(op, "scatter dims already leading");
-    }
-
-    // Only handle the case where every scattered dim is also an inserted (i.e.
-    // collapsed) window dim. Moving such dims to the front does not reorder the
-    // remaining window dims, so `update_window_dims` stay valid and sorted and
-    // the updates tensor need not be transposed. A scattered dim that is *not*
-    // inserted is a partial-slice (dynamic-update-slice) dim, which cannot be
-    // represented as an iree_linalg_ext.scatter and is handled separately.
-    llvm::SmallVector<bool> isScatterDim(rank, false);
-    for (int64_t dim : scatterDimsToOperandDims) {
-      isScatterDim[dim] = true;
-    }
-    llvm::SmallVector<bool> isInsertedDim(rank, false);
-    for (int64_t dim : dimNumbers.getInsertedWindowDims()) {
-      isInsertedDim[dim] = true;
-    }
-    for (int64_t dim : scatterDimsToOperandDims) {
-      if (!isInsertedDim[dim]) {
-        return rewriter.notifyMatchFailure(
-            op, "scattered dim is not an inserted window dim");
-      }
-    }
-    llvm::SmallVector<int64_t> perm(scatterDimsToOperandDims.begin(),
-                                    scatterDimsToOperandDims.end());
-    for (int64_t d = 0; d < rank; ++d) {
-      if (!isScatterDim[d]) {
-        perm.push_back(d);
-      }
-    }
-    llvm::SmallVector<int64_t> invPerm(rank);
-    for (int64_t j = 0; j < rank; ++j) {
-      invPerm[perm[j]] = j;
-    }
-
-    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
-    auto transpose = [&](Value v, ArrayRef<int64_t> p) -> Value {
-      auto ty = cast<RankedTensorType>(v.getType());
-      llvm::SmallVector<int64_t> newShape;
-      newShape.reserve(p.size());
-      for (int64_t d : p) {
-        newShape.push_back(ty.getDimSize(d));
-      }
-      return mlir::stablehlo::TransposeOp::create(
-          b, ty.clone(newShape), v, b.getDenseI64ArrayAttr(p));
-    };
-
-    // Transpose every operand (init) so scattered dims lead.
-    llvm::SmallVector<Value> newInputs;
-    llvm::SmallVector<Type> newResultTypes;
-    for (Value input : op.getInputs()) {
-      Value t = transpose(input, perm);
-      newInputs.push_back(t);
-      newResultTypes.push_back(t.getType());
-    }
-
-    // Remap the dimension numbers into the permuted operand space.
-    llvm::SmallVector<int64_t> newScatterDims;
-    for (int64_t dim : scatterDimsToOperandDims) {
-      newScatterDims.push_back(invPerm[dim]);
-    }
-    llvm::SmallVector<int64_t> newInsertedWindowDims;
-    for (int64_t dim : dimNumbers.getInsertedWindowDims()) {
-      newInsertedWindowDims.push_back(invPerm[dim]);
-    }
-    llvm::sort(newInsertedWindowDims);
-
-    auto newDimNumbers = mlir::stablehlo::ScatterDimensionNumbersAttr::get(
-        op.getContext(), dimNumbers.getUpdateWindowDims(), newInsertedWindowDims,
-        /*inputBatchingDims=*/{}, /*scatterIndicesBatchingDims=*/{},
-        newScatterDims, dimNumbers.getIndexVectorDim());
-
-    auto newScatter = mlir::stablehlo::ScatterOp::create(
-        rewriter, op.getLoc(), newResultTypes, newInputs,
-        op.getScatterIndices(), op.getUpdates(), newDimNumbers,
-        op.getIndicesAreSorted(), op.getUniqueIndices());
-    rewriter.cloneRegionBefore(op.getUpdateComputation(),
-                               newScatter.getUpdateComputation(),
-                               newScatter.getUpdateComputation().end());
-
-    // Transpose the results back to the original operand layout.
-    llvm::SmallVector<Value> newResults;
-    for (Value result : newScatter.getResults()) {
-      newResults.push_back(transpose(result, invPerm));
-    }
-    rewriter.replaceOp(op, newResults);
-    return success();
-  }
-};
-
 // Converts a `stablehlo.scatter` that writes a single, full-rank contiguous
 // slice with an overwrite computation into a `stablehlo.dynamic_update_slice`.
 //
@@ -2541,13 +2410,13 @@ struct StableHLOToStableHLOPreprocessing final
     patterns.insert<RngBitcastFloat>(context);
 
     // scatter canonicalization patterns
-    // Ordering via benefits: batching dims are lowered to explicit index columns
-    // first (the other patterns don't understand them), then the operand is
-    // transposed so the scattered dims lead (required by iree_linalg_ext.scatter
-    // / assumed by the remaining canonicalizers).
+    // Ordering via benefits: dynamic-update-slice scatters are peeled off first
+    // (benefit 4), then batching dims are lowered to explicit index columns
+    // (benefit 3; the remaining patterns don't understand them). The default
+    // benefit patterns — including the upstream ScatterIndexedDimsFirst, which
+    // transposes the operand so scattered dims lead — run last.
     patterns.insert<ScatterToDynamicUpdateSlice>(context, /*benefit=*/4);
     patterns.insert<ScatterBatchingDimsExpander>(context, /*benefit=*/3);
-    patterns.insert<ScatterOperandDimsToLeading>(context, /*benefit=*/2);
     patterns
         .insert<ScatterInt64Indices, ScatterImplicitIndex, ScatterImplicitBatch,
                 ScatterMaterializeInsertedDim, ScatterCollapseBatch,
