@@ -529,8 +529,8 @@ func.func @custom_call_bottomk(%arg0 : tensor<1x160xf32>, %arg1 : tensor<f32>, %
 // Scatter batching dims are lowered to an explicit iota index column so that no
 // batching dims remain for the downstream canonicalizers.
 // CHECK-LABEL: @scatter_batching_dims
-func.func @scatter_batching_dims(%operand: tensor<8x33xi32>, %indices: tensor<8x32x1xi32>, %updates: tensor<8x32xi32>) -> tensor<8x33xi32> {
-  // CHECK: %[[IOTA:.+]] = stablehlo.iota dim = 0 : tensor<8x32x1xi32>
+func.func @scatter_batching_dims(%operand: tensor<2x5xi32>, %indices: tensor<2x3x1xi32>, %updates: tensor<2x3xi32>) -> tensor<2x5xi32> {
+  // CHECK: %[[IOTA:.+]] = stablehlo.iota dim = 0 : tensor<2x3x1xi32>
   // CHECK: %[[CAT:.+]] = stablehlo.concatenate %[[IOTA]], %{{.+}}, dim = 2
   // CHECK: stablehlo.scatter
   // CHECK-NOT: input_batching_dims
@@ -539,8 +539,8 @@ func.func @scatter_batching_dims(%operand: tensor<8x33xi32>, %indices: tensor<8x
   ^bb0(%a: tensor<i32>, %b: tensor<i32>):
     %m = stablehlo.minimum %a, %b : tensor<i32>
     stablehlo.return %m : tensor<i32>
-  }) : (tensor<8x33xi32>, tensor<8x32x1xi32>, tensor<8x32xi32>) -> tensor<8x33xi32>
-  return %0 : tensor<8x33xi32>
+  }) : (tensor<2x5xi32>, tensor<2x3x1xi32>, tensor<2x3xi32>) -> tensor<2x5xi32>
+  return %0 : tensor<2x5xi32>
 }
 
 // -----
@@ -600,7 +600,7 @@ func.func @scatter_i64_indices(
 // A single-index, full-rank, overwrite scatter (dynamic-update-slice semantics)
 // becomes a stablehlo.dynamic_update_slice.
 // CHECK-LABEL: @scatter_to_dynamic_update_slice
-func.func @scatter_to_dynamic_update_slice(%operand: tensor<8x7x24x32xf32>, %indices: tensor<1xi32>, %updates: tensor<8x4x24x32xf32>) -> tensor<8x7x24x32xf32> {
+func.func @scatter_to_dynamic_update_slice(%operand: tensor<2x7x3x3xf32>, %indices: tensor<1xi32>, %updates: tensor<2x4x3x3xf32>) -> tensor<2x7x3x3xf32> {
   // CHECK: %[[C0:.+]] = stablehlo.constant dense<0> : tensor<i32>
   // CHECK: %[[IDX:.+]] = stablehlo.reshape %{{.+}} : (tensor<1xi32>) -> tensor<i32>
   // CHECK: stablehlo.dynamic_update_slice %{{.+}}, %{{.+}}, %[[C0]], %[[IDX]], %[[C0]], %[[C0]]
@@ -608,8 +608,8 @@ func.func @scatter_to_dynamic_update_slice(%operand: tensor<8x7x24x32xf32>, %ind
   %0 = "stablehlo.scatter"(%operand, %indices, %updates) <{indices_are_sorted = true, scatter_dimension_numbers = #stablehlo.scatter<update_window_dims = [0, 1, 2, 3], scatter_dims_to_operand_dims = [1]>, unique_indices = true}> ({
   ^bb0(%a: tensor<f32>, %b: tensor<f32>):
     stablehlo.return %b : tensor<f32>
-  }) : (tensor<8x7x24x32xf32>, tensor<1xi32>, tensor<8x4x24x32xf32>) -> tensor<8x7x24x32xf32>
-  return %0 : tensor<8x7x24x32xf32>
+  }) : (tensor<2x7x3x3xf32>, tensor<1xi32>, tensor<2x4x3x3xf32>) -> tensor<2x7x3x3xf32>
+  return %0 : tensor<2x7x3x3xf32>
 }
 
 // -----

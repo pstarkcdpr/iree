@@ -458,12 +458,11 @@ struct TransposeReshapeGenericDotGeneral final
 // supporting helpers in
 // third_party/stablehlo/stablehlo/transforms/StablehloCompatibilityExpander.cpp
 // (mergeSortedDims / fitsInIntegralType / promoteTypeForSize /
-// getUpdatedIndicesAreSorted / createConcatIndices). They are copied rather than
-// reused because the upstream pattern lives in an anonymous namespace (not
-// exported), and its only public entry point
-// (populateStablehloCompatibilityExpanderPatterns) is a version-gated bundle
-// that would also pull in unrelated compatibility expanders. Check that file for
-// upstream fixes if this code needs updating.
+// getUpdatedIndicesAreSorted / createConcatIndices). They are copied rather
+// than reused because the upstream pattern lives in an anonymous namespace, and
+// its only public entry point (populateStablehloCompatibilityExpanderPatterns)
+// is a version-gated bundle that would also pull in unrelated compatibility
+// expanders.
 //
 // Merges two sorted lists of dimensions into a single sorted list.
 SmallVector<int64_t> mergeSortedDims(ArrayRef<int64_t> dims1,
@@ -2410,13 +2409,8 @@ struct StableHLOToStableHLOPreprocessing final
     patterns.insert<RngBitcastFloat>(context);
 
     // scatter canonicalization patterns
-    // Ordering via benefits: dynamic-update-slice scatters are peeled off first
-    // (benefit 4), then batching dims are lowered to explicit index columns
-    // (benefit 3; the remaining patterns don't understand them). The default
-    // benefit patterns — including the upstream ScatterIndexedDimsFirst, which
-    // transposes the operand so scattered dims lead — run last.
-    patterns.insert<ScatterToDynamicUpdateSlice>(context, /*benefit=*/4);
-    patterns.insert<ScatterBatchingDimsExpander>(context, /*benefit=*/3);
+    patterns.insert<ScatterToDynamicUpdateSlice>(context, /*benefit=*/3);
+    patterns.insert<ScatterBatchingDimsExpander>(context, /*benefit=*/2);
     patterns
         .insert<ScatterInt64Indices, ScatterImplicitIndex, ScatterImplicitBatch,
                 ScatterMaterializeInsertedDim, ScatterCollapseBatch,
