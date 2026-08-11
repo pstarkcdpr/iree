@@ -117,6 +117,74 @@ struct ConcatenateConverter final
   }
 };
 
+// Rewrites a `dynamic_slice` of a 1-D `iota` into scalar index arithmetic.
+// Because `iota[i] == i`, taking `k` elements starting at `s` produces the
+// values `[s, s + 1, ..., s + k - 1]`, where `s` is the start index clamped to
+// the valid range `[0, dim - k]`. This keeps an index that is already available
+// as a scalar out of tensor land, where it would otherwise have to be computed
+// on the device and read back.
+struct IotaDynamicSliceConverter final
+    : OpRewritePattern<mlir::stablehlo::DynamicSliceOp> {
+  using Base::Base;
+
+  LogicalResult matchAndRewrite(mlir::stablehlo::DynamicSliceOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!opIsShapeComputation(op)) {
+      return failure();
+    }
+
+    auto iota = op.getOperand().getDefiningOp<mlir::stablehlo::IotaOp>();
+    if (!iota) {
+      return failure();
+    }
+
+    auto operandTy = dyn_cast<RankedTensorType>(iota.getType());
+    auto resultTy = dyn_cast<RankedTensorType>(op.getType());
+    if (!operandTy || !resultTy || operandTy.getRank() != 1 ||
+        iota.getIotaDimension() != 0 || !operandTy.hasStaticShape() ||
+        !resultTy.hasStaticShape()) {
+      return failure();
+    }
+
+    // Only signless integers can be fed to the arith ops emitted below.
+    Type elementTy = resultTy.getElementType();
+    Value startIndex = op.getStartIndices().front();
+    if (!elementTy.isSignlessInteger() ||
+        !getElementTypeOrSelf(startIndex.getType()).isSignlessInteger()) {
+      return failure();
+    }
+
+    Location loc = op.getLoc();
+    int64_t sliceSize = resultTy.getDimSize(0);
+    int64_t maxStart = operandTy.getDimSize(0) - sliceSize;
+
+    // Clamp in `index` so that narrow start index types cannot overflow.
+    Value start =
+        tensor::ExtractOp::create(rewriter, loc, startIndex, ValueRange({}));
+    Value startIdx = arith::IndexCastOp::create(rewriter, loc,
+                                                rewriter.getIndexType(), start);
+    Value lb = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    Value ub = arith::ConstantIndexOp::create(rewriter, loc, maxStart);
+    Value clamped = arith::MaxSIOp::create(rewriter, loc, startIdx, lb);
+    clamped = arith::MinSIOp::create(rewriter, loc, clamped, ub);
+
+    SmallVector<Value> elements;
+    elements.reserve(sliceSize);
+    for (int64_t i = 0; i < sliceSize; ++i) {
+      Value element = clamped;
+      if (i != 0) {
+        Value offset = arith::ConstantIndexOp::create(rewriter, loc, i);
+        element = arith::AddIOp::create(rewriter, loc, element, offset);
+      }
+      elements.push_back(
+          arith::IndexCastOp::create(rewriter, loc, elementTy, element));
+    }
+
+    rewriter.replaceOpWithNewOp<tensor::FromElementsOp>(op, resultTy, elements);
+    return success();
+  }
+};
+
 struct GetDimSizeConverter final
     : OpRewritePattern<mlir::stablehlo::GetDimensionSizeOp> {
   using Base::Base;
@@ -189,6 +257,8 @@ void populateLegalizeShapeComputationPatterns(MLIRContext *context,
                 HloElementwiseConverter<mlir::stablehlo::AddOp>,
                 HloElementwiseConverter<mlir::stablehlo::AndOp>,
                 HloElementwiseConverter<mlir::stablehlo::CeilOp>,
+                HloElementwiseConverter<mlir::stablehlo::ClampOp>,
+                HloElementwiseConverter<mlir::stablehlo::CompareOp>,
                 HloElementwiseConverter<mlir::stablehlo::ConvertOp>,
                 HloElementwiseConverter<mlir::stablehlo::DivOp>,
                 HloElementwiseConverter<mlir::stablehlo::FloorOp>,
@@ -196,12 +266,14 @@ void populateLegalizeShapeComputationPatterns(MLIRContext *context,
                 HloElementwiseConverter<mlir::stablehlo::MinOp>,
                 HloElementwiseConverter<mlir::stablehlo::MulOp>,
                 HloElementwiseConverter<mlir::stablehlo::NegOp>,
+                HloElementwiseConverter<mlir::stablehlo::RemOp>,
                 HloElementwiseConverter<mlir::stablehlo::RoundOp>,
                 HloElementwiseConverter<mlir::stablehlo::RsqrtOp>,
+                HloElementwiseConverter<mlir::stablehlo::SelectOp>,
                 HloElementwiseConverter<mlir::stablehlo::SqrtOp>,
                 HloElementwiseConverter<mlir::stablehlo::SubtractOp>,
-                ConcatenateConverter, GetDimSizeConverter, ReshapeConverter>(
-      context);
+                ConcatenateConverter, GetDimSizeConverter,
+                IotaDynamicSliceConverter, ReshapeConverter>(context);
 }
 
 } // namespace mlir::iree_compiler::stablehlo
