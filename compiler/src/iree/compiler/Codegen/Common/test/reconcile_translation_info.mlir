@@ -1021,3 +1021,41 @@ hal.executable private @bounded_scf_forall_3D_interchange {
 //      CHECK:   scf.for %[[IV:.+]] = %[[IDX]] to %[[NITERS]] step %[[COUNTX]]
 //      CHECK:     %[[DELINEARIZE:.+]]:3 = affine.delinearize_index %[[IV]] into (%[[UB1]], %[[UB2]], %[[UB0]])
 //      CHECK:     "use"(%[[DELINEARIZE]]#2, %[[DELINEARIZE]]#0, %[[DELINEARIZE]]#1)
+
+// -----
+
+// A statically known workgroup count that exceeds the max workgroup count is
+// clamped to the max, with the remaining work handled by the loop nest.
+
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+    #hal.pipeline.binding<storage_buffer>]>
+hal.executable private @bounded_static_scf_forall_3D {
+  hal.executable.variant public @bounded_static_scf_forall_3D target(#hal.executable.target<"", "", {
+      iree_codegen.target_info = #iree_codegen.simple_target<max_workgroup_count = [1024, 512, 256]>}>) {
+    hal.executable.export public @bounded_static_scf_forall_3D layout(#pipeline_layout)
+    count(%arg0: !hal.device) -> (index, index, index) {
+      %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice()
+      hal.return %x, %y, %z : index, index, index
+    }
+    builtin.module {
+      func.func @bounded_static_scf_forall_3D() {
+        scf.forall (%arg0, %arg1, %arg2) in (16, 206, 32) {
+          "use"(%arg0, %arg1, %arg2) : (index, index, index) -> ()
+          scf.forall.in_parallel {}
+        } {mapping = [#iree_codegen.workgroup_mapping<z>, #iree_codegen.workgroup_mapping<y>, #iree_codegen.workgroup_mapping<x>]}
+        return
+      }
+    }
+  }
+}
+//      CHECK: hal.executable.export public @bounded_static_scf_forall_3D
+//  CHECK-DAG:   %[[C1024:.+]] = arith.constant 1024 : index
+//  CHECK-DAG:   %[[C1:.+]] = arith.constant 1 : index
+//      CHECK:   hal.return %[[C1024]], %[[C1]], %[[C1]]
+//      CHECK: func.func @bounded_static_scf_forall_3D()
+//  CHECK-DAG:   %[[NITERS:.+]] = arith.constant 105472 : index
+//  CHECK-DAG:   %[[IDX:.+]] = hal.interface.workgroup.id[0] : index
+//  CHECK-DAG:   %[[COUNTX:.+]] = hal.interface.workgroup.count[0] : index
+//      CHECK:   scf.for %[[IV:.+]] = %[[IDX]] to %[[NITERS]] step %[[COUNTX]]
+//      CHECK:     %[[DELINEARIZE:.+]]:3 = affine.delinearize_index %[[IV]] into (16, 206, 32)
+//      CHECK:     "use"(%[[DELINEARIZE]]#0, %[[DELINEARIZE]]#1, %[[DELINEARIZE]]#2)

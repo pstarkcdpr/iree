@@ -343,10 +343,12 @@ resolveWorkgroupForAll(RewriterBase &rewriter, scf::ForallOp forallOp,
       }
       if (std::optional<int64_t> numWorkgroupsStatic =
               getConstantIntValue(numWorkgroups)) {
+        // A statically known number of workgroups that fits within the limit
+        // needs neither a loop nest nor a bound on the workgroup count.
         if (numWorkgroupsStatic.value() <= maxCount) {
           generateLoopNest[index] = false;
+          continue;
         }
-        continue;
       }
     }
 
