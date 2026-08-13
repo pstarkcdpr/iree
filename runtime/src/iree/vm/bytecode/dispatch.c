@@ -341,6 +341,73 @@ static iree_status_t iree_vm_bytecode_external_leave(
   return iree_vm_stack_function_leave(stack);
 }
 
+// Returns true if |cconv_fragment| only contains types we can marshal by
+// walking it in lockstep with a register list (one register per type).
+// Variadic spans are only valid on imports and are not supported here.
+static bool iree_vm_bytecode_cconv_fragment_is_simple(
+    iree_string_view_t cconv_fragment) {
+  for (iree_host_size_t i = 0; i < cconv_fragment.size; ++i) {
+    switch (cconv_fragment.data[i]) {
+      case IREE_VM_CCONV_TYPE_VOID:
+      case IREE_VM_CCONV_TYPE_I32:
+      case IREE_VM_CCONV_TYPE_F32:
+      case IREE_VM_CCONV_TYPE_I64:
+      case IREE_VM_CCONV_TYPE_F64:
+      case IREE_VM_CCONV_TYPE_REF:
+        break;
+      default:
+        return false;
+    }
+  }
+  return true;
+}
+
+// Looks up the calling convention fragments of an internal function.
+// Both fragments are set to empty if the module does not declare a usable
+// signature for the function; callers must then fall back to treating every
+// value register as a single 32-bit word.
+static void iree_vm_bytecode_internal_function_cconv(
+    iree_vm_module_t* module, int32_t function_ordinal,
+    iree_string_view_t* out_cconv_arguments,
+    iree_string_view_t* out_cconv_results) {
+  *out_cconv_arguments = iree_string_view_empty();
+  *out_cconv_results = iree_string_view_empty();
+  iree_vm_bytecode_module_t* bytecode_module =
+      (iree_vm_bytecode_module_t*)module->self;
+  iree_vm_FunctionSignatureDef_vec_t function_signatures =
+      iree_vm_BytecodeModuleDef_function_signatures(bytecode_module->def);
+  if (!function_signatures ||
+      (iree_host_size_t)function_ordinal >=
+          iree_vm_FunctionSignatureDef_vec_len(function_signatures)) {
+    return;
+  }
+  iree_vm_FunctionSignatureDef_table_t signature_def =
+      iree_vm_FunctionSignatureDef_vec_at(function_signatures,
+                                          function_ordinal);
+  if (!signature_def) return;
+  flatbuffers_string_t cconv_str =
+      iree_vm_FunctionSignatureDef_calling_convention(signature_def);
+  if (!cconv_str || flatbuffers_string_len(cconv_str) == 0) return;
+  iree_vm_function_signature_t signature = {
+      .calling_convention =
+          iree_make_string_view(cconv_str, flatbuffers_string_len(cconv_str)),
+  };
+  iree_string_view_t cconv_arguments = iree_string_view_empty();
+  iree_string_view_t cconv_results = iree_string_view_empty();
+  iree_status_t status = iree_vm_function_call_get_cconv_fragments(
+      &signature, &cconv_arguments, &cconv_results);
+  if (!iree_status_is_ok(status)) {
+    iree_status_ignore(status);
+    return;
+  }
+  if (!iree_vm_bytecode_cconv_fragment_is_simple(cconv_arguments) ||
+      !iree_vm_bytecode_cconv_fragment_is_simple(cconv_results)) {
+    return;
+  }
+  *out_cconv_arguments = cconv_arguments;
+  *out_cconv_results = cconv_results;
+}
+
 // Enters an internal bytecode stack frame from a parent bytecode frame.
 // Registers in |src_reg_list| will be marshaled into the callee frame and the
 // |dst_reg_list| will be stashed for use when leaving the frame.
@@ -362,9 +429,21 @@ static iree_status_t iree_vm_bytecode_internal_enter(
   function.module = module;
   function.linkage = IREE_VM_FUNCTION_LINKAGE_INTERNAL;
   function.ordinal = function_ordinal;
-  IREE_RETURN_IF_ERROR(
-      iree_vm_bytecode_function_enter(stack, function, iree_string_view_empty(),
-                                      out_callee_frame, out_callee_registers));
+  // Resolve the callee signature so we know the width of each argument/result.
+  // 64-bit values occupy two consecutive i32 register slots and the callee's
+  // ABI registers align them to an even ordinal (see
+  // iree_vm_bytecode_external_enter and the compiler's RegisterBank), so we
+  // cannot infer the layout from the register list alone.
+  iree_string_view_t cconv_arguments = iree_string_view_empty();
+  iree_string_view_t cconv_results = iree_string_view_empty();
+  iree_vm_bytecode_internal_function_cconv(module, function_ordinal,
+                                           &cconv_arguments, &cconv_results);
+
+  // Stash the results cconv on the callee frame so the matching
+  // iree_vm_bytecode_internal_leave can marshal results back without having to
+  // look the signature up again.
+  IREE_RETURN_IF_ERROR(iree_vm_bytecode_function_enter(
+      stack, function, cconv_results, out_callee_frame, out_callee_registers));
 
   // Remaps argument/result registers from a source list in the caller/callee
   // frame to the 0-N ABI registers in the callee/caller frame.
@@ -376,23 +455,64 @@ static iree_status_t iree_vm_bytecode_internal_enter(
   iree_vm_registers_t src_regs =
       iree_vm_bytecode_get_register_storage(caller_frame);
   iree_vm_registers_t* dst_regs = out_callee_registers;
-  int i32_reg_offset = 0;
-  int ref_reg_offset = 0;
-  for (int i = 0; i < src_reg_list->size; ++i) {
-    // TODO(benvanik): change encoding to avoid this branching.
-    // Could write two arrays: one for prims and one for refs.
-    uint16_t src_reg = src_reg_list->registers[i];
-    if (src_reg & IREE_VM_ISA_REF_REGISTER_TYPE_BIT) {
-      uint16_t dst_reg = ref_reg_offset++;
-      memset(&dst_regs->ref[dst_reg & IREE_VM_ISA_REF_REGISTER_MASK], 0,
-             sizeof(iree_vm_ref_t));
-      iree_vm_ref_retain_or_move(
-          src_reg & IREE_VM_ISA_REF_REGISTER_MOVE_BIT,
-          &src_regs.ref[src_reg & IREE_VM_ISA_REF_REGISTER_MASK],
-          &dst_regs->ref[dst_reg & IREE_VM_ISA_REF_REGISTER_MASK]);
-    } else {
-      uint16_t dst_reg = i32_reg_offset++;
-      dst_regs->i32[dst_reg] = src_regs.i32[src_reg];
+  uint16_t i32_reg_offset = 0;
+  uint16_t ref_reg_offset = 0;
+  if (cconv_arguments.size > 0) {
+    // Walk the callee signature in lockstep with the caller's register list;
+    // there is exactly one source register per argument (a 64-bit value is
+    // named by its low ordinal and occupies that ordinal and the next).
+    int reg_i = 0;
+    for (iree_host_size_t i = 0;
+         i < cconv_arguments.size && reg_i < src_reg_list->size; ++i) {
+      switch (cconv_arguments.data[i]) {
+        case IREE_VM_CCONV_TYPE_VOID:
+          break;
+        case IREE_VM_CCONV_TYPE_I32:
+        case IREE_VM_CCONV_TYPE_F32: {
+          uint16_t src_reg = src_reg_list->registers[reg_i++];
+          dst_regs->i32[i32_reg_offset++] = src_regs.i32[src_reg];
+        } break;
+        case IREE_VM_CCONV_TYPE_I64:
+        case IREE_VM_CCONV_TYPE_F64: {
+          uint16_t src_reg = src_reg_list->registers[reg_i++];
+          i32_reg_offset = (uint16_t)iree_host_align(i32_reg_offset, 2);
+          memcpy(&dst_regs->i32[i32_reg_offset], &src_regs.i32[src_reg],
+                 sizeof(int64_t));
+          i32_reg_offset += 2;
+        } break;
+        case IREE_VM_CCONV_TYPE_REF: {
+          uint16_t src_reg = src_reg_list->registers[reg_i++];
+          uint16_t dst_reg = ref_reg_offset++;
+          memset(&dst_regs->ref[dst_reg & IREE_VM_ISA_REF_REGISTER_MASK], 0,
+                 sizeof(iree_vm_ref_t));
+          iree_vm_ref_retain_or_move(
+              src_reg & IREE_VM_ISA_REF_REGISTER_MOVE_BIT,
+              &src_regs.ref[src_reg & IREE_VM_ISA_REF_REGISTER_MASK],
+              &dst_regs->ref[dst_reg & IREE_VM_ISA_REF_REGISTER_MASK]);
+        } break;
+        default:
+          break;
+      }
+    }
+  } else {
+    // No usable signature: fall back to treating every value register as a
+    // single 32-bit word. 64-bit arguments are not representable this way.
+    for (int i = 0; i < src_reg_list->size; ++i) {
+      // TODO(benvanik): change encoding to avoid this branching.
+      // Could write two arrays: one for prims and one for refs.
+      uint16_t src_reg = src_reg_list->registers[i];
+      if (src_reg & IREE_VM_ISA_REF_REGISTER_TYPE_BIT) {
+        uint16_t dst_reg = ref_reg_offset++;
+        memset(&dst_regs->ref[dst_reg & IREE_VM_ISA_REF_REGISTER_MASK], 0,
+               sizeof(iree_vm_ref_t));
+        iree_vm_ref_retain_or_move(
+            src_reg & IREE_VM_ISA_REF_REGISTER_MOVE_BIT,
+            &src_regs.ref[src_reg & IREE_VM_ISA_REF_REGISTER_MASK],
+            &dst_regs->ref[dst_reg & IREE_VM_ISA_REF_REGISTER_MASK]);
+      } else {
+        uint16_t dst_reg = i32_reg_offset++;
+        dst_regs->i32[dst_reg] = src_regs.i32[src_reg];
+      }
     }
   }
 
@@ -429,9 +549,25 @@ static iree_status_t iree_vm_bytecode_internal_leave(
     return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
                             "src/dst reg count mismatch on internal return");
   }
+  iree_vm_bytecode_frame_storage_t* callee_storage =
+      (iree_vm_bytecode_frame_storage_t*)iree_vm_stack_frame_storage(
+          callee_frame);
+  // The callee's results cconv was stashed on entry; it tells us which values
+  // are 64-bit and so span two i32 register slots. If it is unavailable every
+  // value is copied as a single 32-bit word (legacy behavior).
+  iree_string_view_t cconv_results = callee_storage->cconv_results;
+  iree_host_size_t cconv_i = 0;
   iree_vm_registers_t caller_registers =
       iree_vm_bytecode_get_register_storage(caller_frame);
   for (int i = 0; i < src_reg_list->size; ++i) {
+    // Advance to the cconv entry describing this value, skipping void markers.
+    while (cconv_i < cconv_results.size &&
+           cconv_results.data[cconv_i] == IREE_VM_CCONV_TYPE_VOID) {
+      ++cconv_i;
+    }
+    const char cconv_type =
+        cconv_i < cconv_results.size ? cconv_results.data[cconv_i] : 0;
+    ++cconv_i;
     // TODO(benvanik): change encoding to avoid this branching.
     // Could write two arrays: one for prims and one for refs.
     uint16_t src_reg = src_reg_list->registers[i];
@@ -441,6 +577,10 @@ static iree_status_t iree_vm_bytecode_internal_leave(
           src_reg & IREE_VM_ISA_REF_REGISTER_MOVE_BIT,
           &callee_registers.ref[src_reg & IREE_VM_ISA_REF_REGISTER_MASK],
           &caller_registers.ref[dst_reg & IREE_VM_ISA_REF_REGISTER_MASK]);
+    } else if (cconv_type == IREE_VM_CCONV_TYPE_I64 ||
+               cconv_type == IREE_VM_CCONV_TYPE_F64) {
+      memcpy(&caller_registers.i32[dst_reg], &callee_registers.i32[src_reg],
+             sizeof(int64_t));
     } else {
       caller_registers.i32[dst_reg] = callee_registers.i32[src_reg];
     }
@@ -450,9 +590,6 @@ static iree_status_t iree_vm_bytecode_internal_leave(
   caller_storage->return_registers = NULL;
 
   // Mark successful completion - compiler guarantees all refs are released.
-  iree_vm_bytecode_frame_storage_t* callee_storage =
-      (iree_vm_bytecode_frame_storage_t*)iree_vm_stack_frame_storage(
-          callee_frame);
   callee_storage->result_code = IREE_STATUS_OK;
 
   // Leave and deallocate bytecode stack frame.

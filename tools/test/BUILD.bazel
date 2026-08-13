@@ -61,6 +61,7 @@ iree_lit_test_suite(
             "parameters_unscoped.mlir",
             "repeated_return.mlir",
             "scalars.mlir",
+            "vm_i64_calls.mlir",
         ],
         include = [
             "*.mlir",

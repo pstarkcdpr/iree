@@ -49,6 +49,7 @@ iree_lit_test_suite(
     "parameters_unscoped.mlir"
     "repeated_return.mlir"
     "scalars.mlir"
+    "vm_i64_calls.mlir"
   TOOLS
     ${IREE_LLD_TARGET}
     FileCheck
