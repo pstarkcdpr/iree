@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "iree/compiler/Codegen/SPIRV/Passes.h"
+#include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -159,10 +160,38 @@ calculateMemRefVectorNumBits(SmallVectorImpl<Operation *> &uses) {
   return minBits;
 }
 
+/// Returns true if the target can hold values of `elementNumBits` in memory.
+///
+/// Vectorizing a memref whose element type the target cannot store leaves the
+/// SPIR-V type converter with a vector it has to widen lane-by-lane (e.g.
+/// vector<4xi8> -> vector<4xi32> when there is no 8-bit storage support). That
+/// widening quadruples the array stride but does not rescale the access chain
+/// index, so the shader silently reads and writes at the wrong addresses. The
+/// scalar path emulates narrow types correctly -- with an explicit divide,
+/// shift and mask -- so such memrefs are better left unvectorized.
+static bool isStorageBitwidthSupported(IREE::GPU::TargetAttr target,
+                                       unsigned elementNumBits) {
+  // Without target information keep the previous behaviour.
+  if (!target) {
+    return true;
+  }
+  IREE::GPU::StorageBitwidths storage = target.getWgp().getStorage().getValue();
+  // Sub-byte types are packed by a separate path and 32-bit and wider types are
+  // always representable; only 8- and 16-bit types get silently widened.
+  switch (elementNumBits) {
+  case 8:
+    return bitEnumContainsAny(storage, IREE::GPU::StorageBitwidths::B8);
+  case 16:
+    return bitEnumContainsAny(storage, IREE::GPU::StorageBitwidths::B16);
+  default:
+    return true;
+  }
+}
+
 /// If the memref is vectorizable return the vector bit count we want to use,
 /// otherwise return 0. If it returns a value greater than 0 it also returns the
 /// memref uses.
-static unsigned isMemRefVectorizable(Value value,
+static unsigned isMemRefVectorizable(Value value, IREE::GPU::TargetAttr target,
                                      SmallVectorImpl<Operation *> &uses) {
   auto memrefType = dyn_cast<MemRefType>(value.getType());
 
@@ -198,6 +227,12 @@ static unsigned isMemRefVectorizable(Value value,
   }
   if (kMaxVectorNumBits % elementNumBits != 0) {
     LLVM_DEBUG(llvm::dbgs() << "failed: element not fitting in vector4\n");
+    return 0;
+  }
+  if (!isStorageBitwidthSupported(target, elementNumBits)) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "failed: target cannot store " << elementNumBits
+               << "-bit elements; leaving to narrow type emulation\n");
     return 0;
   }
 
@@ -263,6 +298,9 @@ public:
 private:
   void analyzeMemRefValue(Value value);
 
+  // The GPU target the module is compiled for, used to reject vectorizing
+  // element types the target cannot hold in memory. May be null.
+  IREE::GPU::TargetAttr target;
   // The mapping from a MemRef value to the number of bits of the vector this
   // MemRef value should be vectorized into.
   llvm::DenseMap<Value, unsigned> valueToVectorBitsMap;
@@ -271,6 +309,7 @@ private:
 };
 
 MemRefUsageAnalysis::MemRefUsageAnalysis(mlir::Operation *op) {
+  target = getGPUTargetAttr(op);
   op->walk([&](Operation *op) {
     TypeSwitch<Operation *>(op)
         .Case([this](mlir::FunctionOpInterface funcOp) {
@@ -287,7 +326,7 @@ MemRefUsageAnalysis::MemRefUsageAnalysis(mlir::Operation *op) {
 void MemRefUsageAnalysis::analyzeMemRefValue(Value value) {
   SmallVector<Operation *> vectorUses;
   LLVM_DEBUG(llvm::dbgs() << "analyzing value: " << value << "\n");
-  if (unsigned vectorSize = isMemRefVectorizable(value, vectorUses)) {
+  if (unsigned vectorSize = isMemRefVectorizable(value, target, vectorUses)) {
     valueToVectorBitsMap.insert(std::make_pair(value, vectorSize));
     transferOps.insert(vectorUses.begin(), vectorUses.end());
   }

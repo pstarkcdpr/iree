@@ -732,3 +732,100 @@ func.func @extract_vector_transfer_read_mask_bits(%arg: vector<3xf32>, %index: i
 //     CHECK: scf.if %[[MB2]] -> (f32) {
 //     CHECK:   memref.load %{{.*}}[%[[C5]]] : memref<20xf32>
 //     CHECK: vector.from_elements {{.+}} : vector<3xf32>
+
+// -----
+
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>
+]>
+#target_8bit_storage = #hal.executable.target<"vulkan-spirv", "vulkan-spirv-fb", {
+  iree_codegen.target_info = #iree_gpu.target<arch = "", features = "spirv:v1.6,cap:Shader", wgp = <
+    compute = fp32|int32|int8, storage = b32|b16|b8, subgroup = none,
+    subgroup_size_choices = [32], max_workgroup_sizes = [128, 128, 64],
+    max_thread_count_per_workgroup = 128, max_workgroup_memory_bytes = 16384,
+    max_workgroup_counts = [65535, 65535, 65535]>>
+}>
+
+// CHECK-LABEL: func.func @resource_copy_i8_8bit_storage
+//       CHECK:   %[[A:.+]] = hal.interface.binding.subspan layout({{.+}}) binding(0) : memref<4096x1024xvector<4xi8>>
+//       CHECK:   %[[B:.+]] = hal.interface.binding.subspan layout({{.+}}) binding(1) : memref<4096x1024xvector<4xi8>>
+//       CHECK:   %[[V:.+]] = memref.load %[[A]][%{{.*}}, %{{.*}}] : memref<4096x1024xvector<4xi8>>
+//       CHECK:   memref.store %[[V]], %[[B]][%{{.*}}, %{{.*}}] : memref<4096x1024xvector<4xi8>>
+func.func @resource_copy_i8_8bit_storage() attributes {hal.executable.target = #target_8bit_storage} {
+  %cst = arith.constant 0 : i8
+  %c0 = arith.constant 0 : index
+  %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) : memref<4096x4096xi8>
+  %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) : memref<4096x4096xi8>
+  %v = vector.transfer_read %0[%c0, %c0], %cst : memref<4096x4096xi8>, vector<4xi8>
+  vector.transfer_write %v, %1[%c0, %c0] : vector<4xi8>, memref<4096x4096xi8>
+  return
+}
+
+// -----
+
+// Without 8-bit storage support the i8 memref must be left alone. Vectorizing it
+// would leave the SPIR-V type converter to widen vector<4xi8> to vector<4xi32>,
+// which quadruples the array stride without rescaling the access chain index and
+// silently reads/writes at the wrong addresses. Narrow type emulation lowers the
+// scalar accesses correctly instead.
+
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>
+]>
+#target_no_8bit_storage = #hal.executable.target<"vulkan-spirv", "vulkan-spirv-fb", {
+  iree_codegen.target_info = #iree_gpu.target<arch = "", features = "spirv:v1.6,cap:Shader", wgp = <
+    compute = fp32|int32, storage = b32|b16, subgroup = none,
+    subgroup_size_choices = [32], max_workgroup_sizes = [128, 128, 64],
+    max_thread_count_per_workgroup = 128, max_workgroup_memory_bytes = 16384,
+    max_workgroup_counts = [65535, 65535, 65535]>>
+}>
+
+// CHECK-LABEL: func.func @resource_copy_i8_no_8bit_storage
+//       CHECK:   %[[A:.+]] = hal.interface.binding.subspan layout({{.+}}) binding(0) : memref<4096x4096xi8>
+//       CHECK:   %[[B:.+]] = hal.interface.binding.subspan layout({{.+}}) binding(1) : memref<4096x4096xi8>
+//       CHECK:   %[[V:.+]] = memref.load %[[A]][%{{.*}}, %{{.*}}] : memref<4096x4096xi8>
+//       CHECK:   memref.store %{{.+}}, %[[B]][%{{.*}}, %{{.*}}] : memref<4096x4096xi8>
+//   CHECK-NOT:   vector<
+func.func @resource_copy_i8_no_8bit_storage() attributes {hal.executable.target = #target_no_8bit_storage} {
+  %cst = arith.constant 0 : i8
+  %c0 = arith.constant 0 : index
+  %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) : memref<4096x4096xi8>
+  %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) : memref<4096x4096xi8>
+  %v = vector.transfer_read %0[%c0, %c0], %cst : memref<4096x4096xi8>, vector<4xi8>
+  vector.transfer_write %v, %1[%c0, %c0] : vector<4xi8>, memref<4096x4096xi8>
+  return
+}
+
+// -----
+
+// Same for 16-bit element types on a target without 16-bit storage support.
+
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>
+]>
+#target_no_16bit_storage = #hal.executable.target<"vulkan-spirv", "vulkan-spirv-fb", {
+  iree_codegen.target_info = #iree_gpu.target<arch = "", features = "spirv:v1.6,cap:Shader", wgp = <
+    compute = fp32|int32, storage = b32, subgroup = none,
+    subgroup_size_choices = [32], max_workgroup_sizes = [128, 128, 64],
+    max_thread_count_per_workgroup = 128, max_workgroup_memory_bytes = 16384,
+    max_workgroup_counts = [65535, 65535, 65535]>>
+}>
+
+// CHECK-LABEL: func.func @resource_copy_f16_no_16bit_storage
+//       CHECK:   %[[A:.+]] = hal.interface.binding.subspan layout({{.+}}) binding(0) : memref<4096x4096xf16>
+//       CHECK:   %[[B:.+]] = hal.interface.binding.subspan layout({{.+}}) binding(1) : memref<4096x4096xf16>
+//       CHECK:   %[[V:.+]] = memref.load %[[A]][%{{.*}}, %{{.*}}] : memref<4096x4096xf16>
+//       CHECK:   memref.store %{{.+}}, %[[B]][%{{.*}}, %{{.*}}] : memref<4096x4096xf16>
+//   CHECK-NOT:   vector<
+func.func @resource_copy_f16_no_16bit_storage() attributes {hal.executable.target = #target_no_16bit_storage} {
+  %cst = arith.constant 0.000000e+00 : f16
+  %c0 = arith.constant 0 : index
+  %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) : memref<4096x4096xf16>
+  %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) : memref<4096x4096xf16>
+  %v = vector.transfer_read %0[%c0, %c0], %cst : memref<4096x4096xf16>, vector<4xf16>
+  vector.transfer_write %v, %1[%c0, %c0] : vector<4xf16>, memref<4096x4096xf16>
+  return
+}
