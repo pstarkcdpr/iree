@@ -71,8 +71,12 @@ func.func @i4_dequant_unit_matmul_f16() attributes {
 
 //         CHECK: spirv.mlir.loop
 
-// Load the quantized weight and get 8xi4 out of it.
-//         CHECK:   %[[LOAD:.+]] = spirv.Load "StorageBuffer" %{{.+}} : vector<4xi32>
+// Load the quantized weight and get 8xi4 out of it. This target has no 8-bit
+// storage, so the i8 buffer the i4 tensor is emulated with cannot be loaded a
+// vector at a time; each byte is read out of its containing i32 and the four
+// of them are reassembled.
+// CHECK-COUNT-4:   spirv.Load "StorageBuffer" %{{.+}} : i32
+//         CHECK:   %[[LOAD:.+]] = spirv.CompositeConstruct %{{.+}}, %{{.+}}, %{{.+}}, %{{.+}} : (i32, i32, i32, i32) -> vector<4xi32>
 //         CHECK:   %[[SHUF01:.+]] = spirv.VectorShuffle [0 : i32, 1 : i32] %[[LOAD]], %[[LOAD]] : vector<4xi32>, vector<4xi32> -> vector<2xi32>
 //         CHECK:   %[[MASKED:.+]] = spirv.BitwiseAnd %[[SHUF01]], %[[CSTVEC2XI32_15]] : vector<2xi32>
 //         CHECK:   %[[SHIFTED:.+]] = spirv.ShiftRightLogical %[[SHUF01]], %[[CSTVEC2XI32_4]] : vector<2xi32>, vector<2xi32>
