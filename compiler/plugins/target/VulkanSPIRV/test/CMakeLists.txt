@@ -15,6 +15,7 @@ iree_lit_test_suite(
     lit
   SRCS
     "materialize_homogeneous_encodings.mlir"
+    "max_workgroup_counts.mlir"
     "smoketest.mlir"
   TOOLS
     FileCheck

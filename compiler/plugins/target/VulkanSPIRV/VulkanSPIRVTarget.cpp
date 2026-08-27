@@ -38,6 +38,7 @@ struct VulkanSPIRVTargetOptions {
   // accepted for now. Eventually we want to use a list for multi-targeting.
   std::string target = "vp_android_baseline_2022";
   bool indirectBindings = false;
+  SmallVector<int32_t> maxWorkgroupCounts;
 
   void bindOptions(OptionsBinder &binder) {
     static llvm::cl::OptionCategory category("VulkanSPIRV HAL Target");
@@ -57,8 +58,53 @@ struct VulkanSPIRVTargetOptions {
         "iree-vulkan-experimental-indirect-bindings", indirectBindings,
         llvm::cl::desc(
             "Force indirect bindings for all generated dispatches."));
+    binder.list<int32_t>(
+        "iree-vulkan-max-workgroup-counts", maxWorkgroupCounts,
+        llvm::cl::CommaSeparated,
+        llvm::cl::desc(
+            "Overrides the maximum number of workgroups the target supports "
+            "along the X/Y/Z dimensions of a single dispatch. Accepts up to "
+            "three comma-separated positive values; dimensions left "
+            "unspecified keep the value from the target description. Work "
+            "that needs more workgroups than the limit allows is wrapped in a "
+            "loop so that each workgroup processes multiple tiles."));
   }
 };
+
+// Returns |target| with the maximum workgroup counts of its workgroup
+// processor replaced by |maxWorkgroupCounts|. Dimensions beyond the ones given
+// keep their original limit. Returns |target| unchanged when no override is
+// given, and nullptr when the override is malformed.
+static IREE::GPU::TargetAttr
+overrideMaxWorkgroupCounts(IREE::GPU::TargetAttr target,
+                           ArrayRef<int32_t> maxWorkgroupCounts) {
+  if (maxWorkgroupCounts.empty()) {
+    return target;
+  }
+  MLIRContext *context = target.getContext();
+  IREE::GPU::TargetWgpAttr wgp = target.getWgp();
+  SmallVector<int32_t> counts(wgp.getMaxWorkgroupCounts().asArrayRef());
+  if (maxWorkgroupCounts.size() > counts.size()) {
+    return nullptr;
+  }
+  for (auto [index, count] : llvm::enumerate(maxWorkgroupCounts)) {
+    if (count < 1) {
+      return nullptr;
+    }
+    counts[index] = count;
+  }
+  auto newWgp = IREE::GPU::TargetWgpAttr::get(
+      context, wgp.getCompute(), wgp.getStorage(), wgp.getSubgroup(),
+      wgp.getDot(), wgp.getMma(), wgp.getScaledMma(),
+      wgp.getSubgroupSizeChoices(), wgp.getMaxWorkgroupSizes(),
+      wgp.getMaxThreadCountPerWorkgroup(), wgp.getMaxWorkgroupMemoryBytes(),
+      DenseI32ArrayAttr::get(context, counts), wgp.getMaxLoadInstructionBits(),
+      wgp.getSimdsPerWgp(), wgp.getVgprSpaceBits(), wgp.getDmaSizes(),
+      wgp.getWorkgroupMemoryBankCount(), wgp.getExtra());
+  return IREE::GPU::TargetAttr::get(context, target.getArch(),
+                                    target.getFeatures(), newWgp,
+                                    target.getChip());
+}
 
 using DescriptorSetLayout = std::pair<unsigned, ArrayRef<PipelineBindingAttr>>;
 
@@ -192,6 +238,13 @@ public:
     Builder b(context);
     SmallVector<NamedAttribute, 1> configItems;
     if (auto target = GPU::getVulkanTargetDetails(options_.target, context)) {
+      target = overrideMaxWorkgroupCounts(target, options_.maxWorkgroupCounts);
+      if (!target) {
+        emitError(b.getUnknownLoc(),
+                  "Invalid --iree-vulkan-max-workgroup-counts; expected at "
+                  "most 3 positive values");
+        return nullptr;
+      }
       addConfigGPUTarget(context, target, configItems);
     } else {
       emitError(b.getUnknownLoc(), "Unknown Vulkan target '")
