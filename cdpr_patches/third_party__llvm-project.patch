@@ -1,5 +1,5 @@
 # Submodule: third_party/llvm-project
-# Generated: 2026-06-26T21:35:53Z
+# Generated: 2026-10-27T18:19:49Z
 
 ## Uncommitted changes ##
 diff --git a/third_party/llvm-project/mlir/lib/Dialect/Linalg/Transforms/Vectorization.cpp b/third_party/llvm-project/mlir/lib/Dialect/Linalg/Transforms/Vectorization.cpp
@@ -30,6 +30,29 @@ index b57e66a1c..3f9d19f57 100644
  }
  
  /// Emit reduction operations if the shapes of the value to reduce is different
+diff --git a/third_party/llvm-project/mlir/lib/Dialect/Vector/Transforms/LowerVectorContract.cpp b/third_party/llvm-project/mlir/lib/Dialect/Vector/Transforms/LowerVectorContract.cpp
+index eaf7bb810..ae3e55e06 100644
+--- a/third_party/llvm-project/mlir/lib/Dialect/Vector/Transforms/LowerVectorContract.cpp
++++ b/third_party/llvm-project/mlir/lib/Dialect/Vector/Transforms/LowerVectorContract.cpp
+@@ -426,6 +426,18 @@ struct UnrolledOuterProductGenerator
+     AffineExpr m, n, k;
+     bindDims(rewriter.getContext(), m, n, k);
+ 
++    // The layouts below expect the lhs to be indexed by `m` and the rhs by `n`.
++    // The multiplication is commutative, so when the lhs is indexed by `n` and
++    // the rhs by `m`, swap the operands together with their indexing maps. The
++    // iteration space, and therefore the mask, is unchanged. Without this, such
++    // contractions fall back to a much more expensive unrolled lowering.
++    if (maps[0].isFunctionOfDim(1) && !maps[0].isFunctionOfDim(0) &&
++        maps[1].isFunctionOfDim(0) && !maps[1].isFunctionOfDim(1)) {
++      std::swap(lhs, rhs);
++      std::swap(maps[0], maps[1]);
++      lhsType = cast<VectorType>(lhs.getType());
++    }
++
+     // Classical row-major matmul:  Just permute the lhs.
+     if (layout({{m, k}, {k, n}, {m, n}})) {
+       if (auto reductionSize = getReductionSize(lhsType, 1)) {
 diff --git a/third_party/llvm-project/mlir/test/Dialect/Linalg/vectorization/extract.mlir b/third_party/llvm-project/mlir/test/Dialect/Linalg/vectorization/extract.mlir
 index 76ac4b839..fc0a11ef9 100644
 --- a/third_party/llvm-project/mlir/test/Dialect/Linalg/vectorization/extract.mlir
@@ -87,4 +110,109 @@ index 76ac4b839..fc0a11ef9 100644
 +     transform.yield
 +   }
 +}
+diff --git a/third_party/llvm-project/mlir/test/Dialect/Vector/vector-contract-to-outerproduct-matmul-transforms.mlir b/third_party/llvm-project/mlir/test/Dialect/Vector/vector-contract-to-outerproduct-matmul-transforms.mlir
+index 7a60ff8ea..346f4129f 100644
+--- a/third_party/llvm-project/mlir/test/Dialect/Vector/vector-contract-to-outerproduct-matmul-transforms.mlir
++++ b/third_party/llvm-project/mlir/test/Dialect/Vector/vector-contract-to-outerproduct-matmul-transforms.mlir
+@@ -67,6 +67,26 @@
+   iterator_types = ["parallel", "parallel", "reduction"]
+ }
+ 
++#matmat_accesses_5 = [
++  affine_map<(m, n, k) -> (k, n)>,
++  affine_map<(m, n, k) -> (m, k)>,
++  affine_map<(m, n, k) -> (m, n)>
++]
++#matmat_trait_5 = {
++  indexing_maps = #matmat_accesses_5,
++  iterator_types = ["parallel", "parallel", "reduction"]
++}
++
++#matmat_accesses_6 = [
++  affine_map<(m, n, k) -> (n, k)>,
++  affine_map<(m, n, k) -> (m, k)>,
++  affine_map<(m, n, k) -> (m, n)>
++]
++#matmat_trait_6 = {
++  indexing_maps = #matmat_accesses_6,
++  iterator_types = ["parallel", "parallel", "reduction"]
++}
++
+ // ============================================================================
+ //  Matmul 0 (plain + masked + mixed types)
+ // ============================================================================
+@@ -390,6 +410,73 @@ func.func @matmul_4_scalable(%A: vector<[2]x1xf32>,
+   return %0 : vector<3x[2]xf32>
+ }
+ 
++// ============================================================================
++//  Matmul 5 (lhs indexed by n, rhs indexed by m: operands are swapped)
++// ============================================================================
++// CHECK-LABEL: func @matmul_5
++// CHECK-SAME: %[[A:[a-zA-Z0-9]*]]: vector<4x3xf32>,
++// CHECK-SAME: %[[B:[a-zA-Z0-9]*]]: vector<2x4xf32>,
++// CHECK-SAME: %[[C:[a-zA-Z0-9]*]]: vector<2x3xf32>
++//      CHECK: %[[Bt:.*]] = vector.transpose %[[B]], [1, 0]
++// CHECK-SAME:  : vector<2x4xf32> to vector<4x2xf32>
++//      CHECK: %[[b0:.*]] = vector.extract %[[Bt]][0] : vector<2xf32> from vector<4x2xf32>
++//      CHECK: %[[a0:.*]] = vector.extract %[[A]][0] : vector<3xf32> from vector<4x3xf32>
++//      CHECK: %[[c0:.*]] = vector.outerproduct %[[b0]], %[[a0]], %[[C]]
++// CHECK-SAME:  : vector<2xf32>, vector<3xf32>
++//      CHECK: %[[b3:.*]] = vector.extract %[[Bt]][3] : vector<2xf32> from vector<4x2xf32>
++//      CHECK: %[[a3:.*]] = vector.extract %[[A]][3] : vector<3xf32> from vector<4x3xf32>
++//      CHECK: %[[c3:.*]] = vector.outerproduct %[[b3]], %[[a3]], %{{[0-9]+}}
++// CHECK-SAME:  : vector<2xf32>, vector<3xf32>
++//      CHECK: return %[[c3]] : vector<2x3xf32>
++func.func @matmul_5(%A: vector<4x3xf32>,
++                    %B: vector<2x4xf32>,
++                    %C: vector<2x3xf32>) -> vector<2x3xf32> {
++  %0 = vector.contract #matmat_trait_5 %A, %B, %C
++    : vector<4x3xf32>, vector<2x4xf32> into vector<2x3xf32>
++  return %0 : vector<2x3xf32>
++}
++
++// CHECK-LABEL: func.func @masked_matmul_5(
++// CHECK-SAME:    %{{.*}}: vector<5x7xf32>,
++// CHECK-SAME:    %{{.*}}: vector<3x5xf32>,
++// CHECK-SAME:    %{{.*}}: vector<3x7xf32>,
++// CHECK-SAME:    %[[IN_MASK:.*]]: vector<3x7x5xi1>) -> vector<3x7xf32> {
++// CHECK:         %[[T_MASK:.*]] = vector.transpose %[[IN_MASK]], [2, 0, 1] : vector<3x7x5xi1> to vector<5x3x7xi1>
++// CHECK:         %[[T_MASK_R0:.*]] = vector.extract %[[T_MASK]][0] : vector<3x7xi1> from vector<5x3x7xi1>
++// CHECK:         %{{.*}} = vector.mask %[[T_MASK_R0]] { vector.outerproduct %{{.*}} {kind = #vector.kind<add>} : vector<3xf32>, vector<7xf32> } : vector<3x7xi1> -> vector<3x7xf32>
++// CHECK-COUNT-4: vector.mask %{{.*}} { vector.outerproduct %{{.*}} {kind = #vector.kind<add>} : vector<3xf32>, vector<7xf32> } : vector<3x7xi1> -> vector<3x7xf32>
++// CHECK-NOT:     vector.outerproduct
++func.func @masked_matmul_5(%A: vector<5x7xf32>,
++                           %B: vector<3x5xf32>,
++                           %C: vector<3x7xf32>,
++                           %m : vector<3x7x5xi1>) -> vector<3x7xf32> {
++  %0 = vector.mask %m { vector.contract #matmat_trait_5 %A, %B, %C
++  : vector<5x7xf32>, vector<3x5xf32> into vector<3x7xf32> } : vector<3x7x5xi1> -> vector<3x7xf32>
++  return %0 : vector<3x7xf32>
++}
++
++// ============================================================================
++//  Matmul 6 (lhs indexed by n, rhs indexed by m, both reduction-minor)
++// ============================================================================
++// CHECK-LABEL: func @matmul_6
++// CHECK-SAME: %[[A:[a-zA-Z0-9]*]]: vector<3x1xf32>,
++// CHECK-SAME: %[[B:[a-zA-Z0-9]*]]: vector<2x1xf32>,
++// CHECK-SAME: %[[C:[a-zA-Z0-9]*]]: vector<2x3xf32>
++//      CHECK: %[[Bt:.*]] = vector.transpose %[[B]], [1, 0]
++//      CHECK: %[[At:.*]] = vector.transpose %[[A]], [1, 0]
++//      CHECK: %[[b0:.*]] = vector.extract %[[Bt]][0] : vector<2xf32> from vector<1x2xf32>
++//      CHECK: %[[a0:.*]] = vector.extract %[[At]][0] : vector<3xf32> from vector<1x3xf32>
++//      CHECK: %[[c0:.*]] = vector.outerproduct %[[b0]], %[[a0]], %[[C]]
++//      CHECK: return %[[c0]] : vector<2x3xf32>
++func.func @matmul_6(%A: vector<3x1xf32>,
++                    %B: vector<2x1xf32>,
++                    %C: vector<2x3xf32>) -> vector<2x3xf32>
++{
++  %0 = vector.contract #matmat_trait_6 %A, %B, %C
++    : vector<3x1xf32>, vector<2x1xf32> into vector<2x3xf32>
++  return %0 : vector<2x3xf32>
++}
++
+ // ============================================================================
+ //  TD sequence
+ // ============================================================================
 
