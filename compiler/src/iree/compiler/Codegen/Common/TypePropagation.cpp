@@ -208,9 +208,14 @@ struct NamedOpTypePropagation : TypePropagationPattern<OpTy> {
       Type legalizedType = this->getTypeConverter()->convertType(resultType);
       resultTypes.push_back(legalizedType);
     }
+    // Carry over all attributes, including inherent ones such as
+    // `indexing_maps` and `cast`, which the builder would otherwise reset to
+    // their defaults. `operandSegmentSizes` is recomputed by the builder.
+    SmallVector<NamedAttribute> attrs = getPrunedAttributeList(
+        namedOp, {namedOp.getOperandSegmentSizesAttrName(),
+                  linalg::LinalgDialect::kMemoizedIndexingMapsAttrName});
     rewriter.replaceOpWithNewOp<OpTy>(namedOp, resultTypes, adaptor.getInputs(),
-                                      adaptor.getOutputs(),
-                                      linalg::getPrunedAttributeList(namedOp));
+                                      adaptor.getOutputs(), attrs);
     return success();
   }
 };

@@ -1702,9 +1702,18 @@ struct ReorderBroadcastInDimOpAndElementwiseOp final
 // operations. For instance, a dot product widening from FP16 to FP32 is better
 // to have the casting operation fused into the dot operation. This decreases
 // the loading required during a dense computation.
+//
+// The fused cast is materialized later as a signed cast (`cast_signed` on the
+// resulting Linalg op), so converts whose semantics differ from a signed cast
+// are not fused: `i1` and unsigned integers convert by zero-extension.
 template <class Op>
 struct FuseWidenOperands final : OpRewritePattern<Op> {
   using OpRewritePattern<Op>::OpRewritePattern;
+
+  static bool hasSignedCastSemantics(Type type) {
+    auto intType = dyn_cast<IntegerType>(type);
+    return !intType || (intType.getWidth() != 1 && !intType.isUnsigned());
+  }
 
   LogicalResult matchAndRewrite(Op op,
                                 PatternRewriter &rewriter) const override {
@@ -1723,7 +1732,9 @@ struct FuseWidenOperands final : OpRewritePattern<Op> {
         }
 
         if (inputType.getIntOrFloatBitWidth() <
-            castedType.getIntOrFloatBitWidth()) {
+                castedType.getIntOrFloatBitWidth() &&
+            hasSignedCastSemantics(inputType) &&
+            hasSignedCastSemantics(castedType)) {
           operands.push_back(convertOp.getOperand());
           continue;
         }

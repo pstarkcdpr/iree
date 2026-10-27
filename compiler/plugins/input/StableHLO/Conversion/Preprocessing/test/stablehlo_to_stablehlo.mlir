@@ -353,6 +353,33 @@ func.func @dot_basic(%arg0: tensor<4x4xf16>, %arg1: tensor<4x4xf16>) -> tensor<4
 
 // -----
 
+// CHECK-LABEL: @dot_no_fuse_i1
+// CHECK-SAME:     (%[[ARG0:.+]]: tensor<4x4xf16>, %[[ARG1:.+]]: tensor<4x4xi1>)
+func.func @dot_no_fuse_i1(%arg0: tensor<4x4xf16>, %arg1: tensor<4x4xi1>) -> tensor<4x4xf32> {
+  %0 = stablehlo.convert %arg0 : (tensor<4x4xf16>) -> tensor<4x4xf32>
+  %1 = stablehlo.convert %arg1 : (tensor<4x4xi1>) -> tensor<4x4xf32>
+  // CHECK: %[[CONVERT:.+]] = stablehlo.convert %[[ARG1]] : (tensor<4x4xi1>) -> tensor<4x4xf32>
+  // CHECK: stablehlo.dot %[[ARG0]], %[[CONVERT]] : (tensor<4x4xf16>, tensor<4x4xf32>)
+  %2 = "stablehlo.dot"(%0, %1) : (tensor<4x4xf32>, tensor<4x4xf32>) -> tensor<4x4xf32>
+  return %2 : tensor<4x4xf32>
+}
+
+// -----
+
+// CHECK-LABEL: @dot_general_no_fuse_unsigned
+// CHECK-SAME:     (%[[ARG0:.+]]: tensor<2x4x4xui8>, %[[ARG1:.+]]: tensor<2x4x4xi8>)
+func.func @dot_general_no_fuse_unsigned(%arg0: tensor<2x4x4xui8>, %arg1: tensor<2x4x4xi8>) -> tensor<2x4x4xf32> {
+  %0 = stablehlo.convert %arg0 : (tensor<2x4x4xui8>) -> tensor<2x4x4xf32>
+  %1 = stablehlo.convert %arg1 : (tensor<2x4x4xi8>) -> tensor<2x4x4xf32>
+  // CHECK: %[[CONVERT:.+]] = stablehlo.convert %[[ARG0]] : (tensor<2x4x4xui8>) -> tensor<2x4x4xf32>
+  // CHECK: stablehlo.dot_general %[[CONVERT]], %[[ARG1]]
+  // CHECK-SAME: (tensor<2x4x4xf32>, tensor<2x4x4xi8>)
+  %2 = stablehlo.dot_general %0, %1, batching_dims = [0] x [0], contracting_dims = [2] x [1] : (tensor<2x4x4xf32>, tensor<2x4x4xf32>) -> tensor<2x4x4xf32>
+  return %2 : tensor<2x4x4xf32>
+}
+
+// -----
+
 // CHECK-LABEL: @convolution
 // CHECK-SAME:     (%[[ARG0:.+]]: tensor<{{.+}}xbf16>, %[[ARG1:.+]]: tensor<{{.+}}xbf16>)
 func.func @convolution(%arg0: tensor<16x32x256xbf16>, %arg1: tensor<1x256x256xbf16>) -> tensor<16x32x256xf32> {

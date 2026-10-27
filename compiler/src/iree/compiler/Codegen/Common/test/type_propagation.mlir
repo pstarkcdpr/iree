@@ -404,6 +404,36 @@ func.func @named_op(%arg0 : tensor<?x?xi8>, %arg1 : tensor<?x?xi8>) -> tensor<?x
 
 // -----
 
+func.func @named_op_preserve_attrs(%arg0 : tensor<128x16xf32>, %arg1 : tensor<4x16xi8>) -> tensor<128x4xf32> {
+  %cst = arith.constant 0.0 : f32
+  %empty = tensor.empty() : tensor<128x4xf32>
+  %fill = linalg.fill ins(%cst : f32) outs(%empty : tensor<128x4xf32>) -> tensor<128x4xf32>
+  %arg1_i1 = arith.trunci %arg1 : tensor<4x16xi8> to tensor<4x16xi1>
+  %gemm = linalg.matmul
+      indexing_maps = [affine_map<(d0, d1, d2) -> (d0, d2)>,
+                       affine_map<(d0, d1, d2) -> (d1, d2)>,
+                       affine_map<(d0, d1, d2) -> (d0, d1)>]
+      {cast = #linalg.type_fn<cast_unsigned>}
+      ins(%arg0, %arg1_i1 : tensor<128x16xf32>, tensor<4x16xi1>)
+      outs(%fill : tensor<128x4xf32>) -> tensor<128x4xf32>
+  return %gemm : tensor<128x4xf32>
+}
+//  CHECK-DAG: #[[$MAP_A:.+]] = affine_map<(d0, d1, d2) -> (d0, d2)>
+//  CHECK-DAG: #[[$MAP_B:.+]] = affine_map<(d0, d1, d2) -> (d1, d2)>
+//  CHECK-DAG: #[[$MAP_C:.+]] = affine_map<(d0, d1, d2) -> (d0, d1)>
+//      CHECK: func @named_op_preserve_attrs(
+// CHECK-SAME:     %[[ARG0:[a-zA-Z0-9]+]]: tensor<128x16xf32>
+// CHECK-SAME:     %[[ARG1:[a-zA-Z0-9]+]]: tensor<4x16xi8>
+//      CHECK:   %[[FILL:.+]] = linalg.fill
+//      CHECK:   %[[GEMM:.+]] = linalg.matmul
+// CHECK-SAME:       indexing_maps = [#[[$MAP_A]], #[[$MAP_B]], #[[$MAP_C]]]
+// CHECK-SAME:       cast = #linalg.type_fn<cast_unsigned>
+// CHECK-SAME:       ins(%[[ARG0]], %[[ARG1]] : tensor<128x16xf32>, tensor<4x16xi8>)
+// CHECK-SAME:       outs(%[[FILL]] :
+//      CHECK:   return %[[GEMM]]
+
+// -----
+
 #pipeline_layout = #hal.pipeline.layout<bindings = [
   #hal.pipeline.binding<storage_buffer>,
   #hal.pipeline.binding<storage_buffer>,
