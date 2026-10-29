@@ -49,6 +49,7 @@ inline void registerMlirPasses() {
   registerViewOpGraphPass();
   registerStripDebugInfoPass();
   registerSymbolDCEPass();
+  registerStabilizePrivateFuncNamesPass();
   bufferization::registerBufferizationPasses();
   registerConvertComplexToStandardPass();
 

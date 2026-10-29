@@ -1,7 +1,149 @@
 # Submodule: third_party/llvm-project
-# Generated: 2026-10-27T18:19:49Z
+# Generated: 2026-10-28T23:45:16Z
 
 ## Uncommitted changes ##
+diff --git a/third_party/llvm-project/mlir/include/mlir/IR/OperationSupport.h b/third_party/llvm-project/mlir/include/mlir/IR/OperationSupport.h
+index c4ba2f324..cda70c6b6 100644
+--- a/third_party/llvm-project/mlir/include/mlir/IR/OperationSupport.h
++++ b/third_party/llvm-project/mlir/include/mlir/IR/OperationSupport.h
+@@ -1195,6 +1195,11 @@ public:
+   /// elements.
+   OpPrintingFlags &elideLargeElementsAttrs(int64_t largeElementLimit = 16);
+ 
++  /// When eliding large elements attributes, include a hash of the element
++  /// data in the elided form, so that elided attributes with different
++  /// contents can still be told apart.
++  OpPrintingFlags &elideLargeElementsAttrsWithHash(bool enable = true);
++
+   /// Enables the printing of large element attributes with a hex string. The
+   /// `largeElementLimit` is used to configure what is considered to be a
+   /// "large" ElementsAttr by providing an upper limit to the number of
+@@ -1208,6 +1213,11 @@ public:
+   /// the string size.
+   OpPrintingFlags &elideLargeResourceString(int64_t largeResourceLimit = 64);
+ 
++  /// When eliding large resources, print a comment with the key and a hash of
++  /// the elided value in place of the resource, so that elided resources with
++  /// different contents can still be told apart.
++  OpPrintingFlags &elideLargeResourceStringWithHash(bool enable = true);
++
+   /// Enable or disable printing of debug information (based on `enable`). If
+   /// 'prettyForm' is set to true, debug information is printed in a more
+   /// readable 'pretty' form. Note: The IR generated with 'prettyForm' is not
+@@ -1239,9 +1249,20 @@ public:
+   /// Print SSA IDs using their NameLoc, if provided, as prefix.
+   OpPrintingFlags &printNameLocAsPrefix(bool enable = true);
+ 
++  /// Print SSA value names derived from a hash of the defining operation
++  /// rather than from the position of the value in the IR. The hash covers the
++  /// defining operation and the operations up to `depth` levels upstream of
++  /// it. If that collides with an existing name, more levels are included.
++  /// This keeps names stable when unrelated operations are added or removed,
++  /// which makes textual diffs of IR more meaningful.
++  OpPrintingFlags &printStableSSANames(bool enable = true, unsigned depth = 0);
++
+   /// Return if the given ElementsAttr should be elided.
+   bool shouldElideElementsAttr(ElementsAttr attr) const;
+ 
++  /// Return if elided ElementsAttr should include a hash of their contents.
++  bool shouldElideElementsAttrWithHash() const;
++
+   /// Return if the given ElementsAttr should be printed as hex string.
+   bool shouldPrintElementsAttrWithHex(ElementsAttr attr) const;
+ 
+@@ -1254,6 +1275,9 @@ public:
+   /// Return the size limit in chars for printing large resources.
+   std::optional<uint64_t> getLargeResourceStringLimit() const;
+ 
++  /// Return if elided resources should be printed as a comment with a hash.
++  bool shouldElideResourceStringWithHash() const;
++
+   /// Return if debug information should be printed.
+   bool shouldPrintDebugInfo() const;
+ 
+@@ -1282,6 +1306,13 @@ public:
+   /// IDs
+   bool shouldUseNameLocAsPrefix() const;
+ 
++  /// Return if the printer should print stable, hash based SSA names.
++  bool shouldPrintStableSSANames() const;
++
++  /// Return the minimum number of upstream levels covered by stable SSA name
++  /// hashes.
++  unsigned getStableSSANameDepth() const;
++
+ private:
+   /// Elide large elements attributes if the number of elements is larger than
+   /// the upper limit.
+@@ -1294,6 +1325,9 @@ private:
+   /// is larger than the upper limit.
+   int64_t elementsAttrHexElementLimit = 100;
+ 
++  /// The minimum number of upstream levels covered by stable SSA name hashes.
++  unsigned stableSSANameDepth = 0;
++
+   /// Print debug information.
+   bool printDebugInfoFlag : 1;
+   bool printDebugInfoPrettyFormFlag : 1;
+@@ -1318,6 +1352,15 @@ private:
+ 
+   /// Print SSA IDs using NameLocs as prefixes
+   bool useNameLocAsPrefix : 1;
++
++  /// Include a hash of the contents when eliding large ElementsAttr.
++  bool elideElementsAttrWithHashFlag : 1;
++
++  /// Include a hash of the contents when eliding large resources.
++  bool elideResourceStringWithHashFlag : 1;
++
++  /// Print SSA names derived from a hash of the defining operation.
++  bool printStableSSANamesFlag : 1;
+ };
+ 
+ //===----------------------------------------------------------------------===//
+diff --git a/third_party/llvm-project/mlir/include/mlir/Transforms/Passes.h b/third_party/llvm-project/mlir/include/mlir/Transforms/Passes.h
+index 4804b023a..db23c5de9 100644
+--- a/third_party/llvm-project/mlir/include/mlir/Transforms/Passes.h
++++ b/third_party/llvm-project/mlir/include/mlir/Transforms/Passes.h
+@@ -46,6 +46,7 @@ class GreedyRewriteConfig;
+ #define GEN_PASS_DECL_REMOVEDEADVALUESPASS
+ #define GEN_PASS_DECL_SCCPPASS
+ #define GEN_PASS_DECL_SROA
++#define GEN_PASS_DECL_STABILIZEPRIVATEFUNCNAMESPASS
+ #define GEN_PASS_DECL_STRIPDEBUGINFOPASS
+ #define GEN_PASS_DECL_SYMBOLDCEPASS
+ #define GEN_PASS_DECL_SYMBOLPRIVATIZEPASS
+diff --git a/third_party/llvm-project/mlir/include/mlir/Transforms/Passes.td b/third_party/llvm-project/mlir/include/mlir/Transforms/Passes.td
+index 1b08ec98b..7e67be4ba 100644
+--- a/third_party/llvm-project/mlir/include/mlir/Transforms/Passes.td
++++ b/third_party/llvm-project/mlir/include/mlir/Transforms/Passes.td
+@@ -514,6 +514,26 @@ def SymbolDCEPass : Pass<"symbol-dce"> {
+   ];
+ }
+ 
++def StabilizePrivateFuncNamesPass : Pass<"stabilize-private-func-names"> {
++  let summary = "Rename private functions based on their contents";
++  let description = [{
++    This pass renames the private functions of every symbol table to names
++    derived from their contents, so that the names do not depend on the order
++    in which the functions were created. This makes textual diffs of IR more
++    meaningful when the producer uniques function names by adding a counter.
++
++    The new name consists of the original name with trailing numeric suffixes
++    (`_N`) removed, followed by a hash of the function. For example,
++    `@normalize_383` becomes `@normalize_1a2b3c4d`. References to other private
++    functions are hashed by their name without suffixes, so a change to a
++    function does not rename its callers. Functions that are identical get an
++    additional numeric suffix, in order.
++
++    Only private functions are renamed, as other functions may be referenced
++    from outside of the IR.
++  }];
++}
++
+ def SymbolPrivatizePass : Pass<"symbol-privatize"> {
+   let summary = "Mark symbols private";
+   let description = [{
 diff --git a/third_party/llvm-project/mlir/lib/Dialect/Linalg/Transforms/Vectorization.cpp b/third_party/llvm-project/mlir/lib/Dialect/Linalg/Transforms/Vectorization.cpp
 index b57e66a1c..3f9d19f57 100644
 --- a/third_party/llvm-project/mlir/lib/Dialect/Linalg/Transforms/Vectorization.cpp
@@ -53,6 +195,695 @@ index eaf7bb810..ae3e55e06 100644
      // Classical row-major matmul:  Just permute the lhs.
      if (layout({{m, k}, {k, n}, {m, n}})) {
        if (auto reductionSize = getReductionSize(lhsType, 1)) {
+diff --git a/third_party/llvm-project/mlir/lib/IR/AsmPrinter.cpp b/third_party/llvm-project/mlir/lib/IR/AsmPrinter.cpp
+index 75008d6cc..f01f889bb 100644
+--- a/third_party/llvm-project/mlir/lib/IR/AsmPrinter.cpp
++++ b/third_party/llvm-project/mlir/lib/IR/AsmPrinter.cpp
+@@ -42,11 +42,13 @@
+ #include "llvm/Support/CommandLine.h"
+ #include "llvm/Support/DebugLog.h"
+ #include "llvm/Support/Endian.h"
++#include "llvm/Support/Format.h"
+ #include "llvm/Support/ManagedStatic.h"
+ #include "llvm/Support/Regex.h"
+ #include "llvm/Support/SaveAndRestore.h"
+ #include "llvm/Support/Threading.h"
+ #include "llvm/Support/raw_ostream.h"
++#include "llvm/Support/xxhash.h"
+ #include <type_traits>
+ 
+ #include <optional>
+@@ -155,11 +157,22 @@ struct AsmPrinterOptions {
+       llvm::cl::desc("Elide ElementsAttrs with \"...\" that have "
+                      "more elements than the given upper limit")};
+ 
++  llvm::cl::opt<bool> elideElementsAttrWithHash{
++      "mlir-elide-elementsattrs-with-hash", llvm::cl::init(false),
++      llvm::cl::desc("Include a hash of the contents in ElementsAttrs elided "
++                     "by --mlir-elide-elementsattrs-if-larger")};
++
+   llvm::cl::opt<unsigned> elideResourceStringsIfLarger{
+       "mlir-elide-resource-strings-if-larger",
+       llvm::cl::desc(
+           "Elide printing value of resources if string is too long in chars.")};
+ 
++  llvm::cl::opt<bool> elideResourceStringsWithHash{
++      "mlir-elide-resource-strings-with-hash", llvm::cl::init(false),
++      llvm::cl::desc("Print resources elided by "
++                     "--mlir-elide-resource-strings-if-larger as a comment "
++                     "with a hash of their value")};
++
+   llvm::cl::opt<bool> printDebugInfoOpt{
+       "mlir-print-debuginfo", llvm::cl::init(false),
+       llvm::cl::desc("Print debug info in MLIR output")};
+@@ -201,6 +214,19 @@ struct AsmPrinterOptions {
+   llvm::cl::opt<bool> useNameLocAsPrefix{
+       "mlir-use-nameloc-as-prefix", llvm::cl::init(false),
+       llvm::cl::desc("Print SSA IDs using NameLocs as prefixes")};
++
++  llvm::cl::opt<bool> printStableSSANames{
++      "mlir-print-stable-ssa-names", llvm::cl::init(false),
++      llvm::cl::desc("Print SSA value names derived from a hash of the "
++                     "defining operation instead of its position, to make "
++                     "textual diffs of IR more meaningful")};
++
++  llvm::cl::opt<unsigned> stableSSANameDepth{
++      "mlir-stable-ssa-name-depth", llvm::cl::init(0),
++      llvm::cl::desc("Minimum number of upstream operation levels covered by "
++                     "the hash used for --mlir-print-stable-ssa-names. More "
++                     "levels are included when names collide. Larger values "
++                     "make a change rename more values downstream of it")};
+ };
+ } // namespace
+ 
+@@ -219,7 +245,8 @@ OpPrintingFlags::OpPrintingFlags()
+       printGenericOpFormFlag(false), skipRegionsFlag(false),
+       assumeVerifiedFlag(false), printLocalScope(false),
+       printValueUsersFlag(false), printUniqueSSAIDsFlag(false),
+-      useNameLocAsPrefix(false) {
++      useNameLocAsPrefix(false), elideElementsAttrWithHashFlag(false),
++      elideResourceStringWithHashFlag(false), printStableSSANamesFlag(false) {
+   // Initialize based upon command line options, if they are available.
+   if (!clOptions.isConstructed())
+     return;
+@@ -239,6 +266,10 @@ OpPrintingFlags::OpPrintingFlags()
+   printValueUsersFlag = clOptions->printValueUsers;
+   printUniqueSSAIDsFlag = clOptions->printUniqueSSAIDs;
+   useNameLocAsPrefix = clOptions->useNameLocAsPrefix;
++  elideElementsAttrWithHashFlag = clOptions->elideElementsAttrWithHash;
++  elideResourceStringWithHashFlag = clOptions->elideResourceStringsWithHash;
++  printStableSSANamesFlag = clOptions->printStableSSANames;
++  stableSSANameDepth = clOptions->stableSSANameDepth;
+ }
+ 
+ /// Enable the elision of large elements attributes, by printing a '...'
+@@ -251,6 +282,11 @@ OpPrintingFlags::elideLargeElementsAttrs(int64_t largeElementLimit) {
+   return *this;
+ }
+ 
++OpPrintingFlags &OpPrintingFlags::elideLargeElementsAttrsWithHash(bool enable) {
++  elideElementsAttrWithHashFlag = enable;
++  return *this;
++}
++
+ OpPrintingFlags &
+ OpPrintingFlags::printLargeElementsAttrWithHex(int64_t largeElementLimit) {
+   elementsAttrHexElementLimit = largeElementLimit;
+@@ -263,6 +299,12 @@ OpPrintingFlags::elideLargeResourceString(int64_t largeResourceLimit) {
+   return *this;
+ }
+ 
++OpPrintingFlags &
++OpPrintingFlags::elideLargeResourceStringWithHash(bool enable) {
++  elideResourceStringWithHashFlag = enable;
++  return *this;
++}
++
+ /// Enable printing of debug information. If 'prettyForm' is set to true,
+ /// debug information is printed in a more readable 'pretty' form.
+ OpPrintingFlags &OpPrintingFlags::enableDebugInfo(bool enable,
+@@ -318,6 +360,11 @@ bool OpPrintingFlags::shouldElideElementsAttr(ElementsAttr attr) const {
+          !llvm::isa<SplatElementsAttr>(attr);
+ }
+ 
++/// Return if elided ElementsAttr should include a hash of their contents.
++bool OpPrintingFlags::shouldElideElementsAttrWithHash() const {
++  return elideElementsAttrWithHashFlag;
++}
++
+ /// Return if the given ElementsAttr should be printed as hex string.
+ bool OpPrintingFlags::shouldPrintElementsAttrWithHex(ElementsAttr attr) const {
+   // -1 is used to disable hex printing.
+@@ -331,6 +378,14 @@ OpPrintingFlags &OpPrintingFlags::printNameLocAsPrefix(bool enable) {
+   return *this;
+ }
+ 
++/// Print SSA value names derived from a hash of the defining operation.
++OpPrintingFlags &OpPrintingFlags::printStableSSANames(bool enable,
++                                                      unsigned depth) {
++  printStableSSANamesFlag = enable;
++  stableSSANameDepth = depth;
++  return *this;
++}
++
+ /// Return the size limit for printing large ElementsAttr.
+ std::optional<int64_t> OpPrintingFlags::getLargeElementsAttrLimit() const {
+   return elementsAttrElementLimit;
+@@ -346,6 +401,11 @@ std::optional<uint64_t> OpPrintingFlags::getLargeResourceStringLimit() const {
+   return resourceStringCharLimit;
+ }
+ 
++/// Return if elided resources should be printed as a comment with a hash.
++bool OpPrintingFlags::shouldElideResourceStringWithHash() const {
++  return elideResourceStringWithHashFlag;
++}
++
+ /// Return if debug information should be printed.
+ bool OpPrintingFlags::shouldPrintDebugInfo() const {
+   return printDebugInfoFlag;
+@@ -387,6 +447,17 @@ bool OpPrintingFlags::shouldUseNameLocAsPrefix() const {
+   return useNameLocAsPrefix;
+ }
+ 
++/// Return if the printer should print stable, hash based SSA names.
++bool OpPrintingFlags::shouldPrintStableSSANames() const {
++  return printStableSSANamesFlag;
++}
++
++/// Return the minimum number of upstream levels covered by stable SSA name
++/// hashes.
++unsigned OpPrintingFlags::getStableSSANameDepth() const {
++  return stableSSANameDepth;
++}
++
+ //===----------------------------------------------------------------------===//
+ // NewLineCounter
+ //===----------------------------------------------------------------------===//
+@@ -1380,6 +1451,217 @@ void AliasState::printAliases(AsmPrinter::Impl &p, NewLineCounter &newLine,
+   }
+ }
+ 
++//===----------------------------------------------------------------------===//
++// Stable hashing
++//===----------------------------------------------------------------------===//
++
++namespace {
++/// Accumulates values into a hash that is stable across runs and platforms.
++/// Unlike `llvm::hash_combine`, the result does not depend on a per-process
++/// seed, so it can be used in output that is compared between runs.
++class StableHasher {
++public:
++  StableHasher &add(uint64_t value) {
++    uint8_t bytes[sizeof(uint64_t)];
++    llvm::support::endian::write64le(bytes, value);
++    data.append(std::begin(bytes), std::end(bytes));
++    return *this;
++  }
++  StableHasher &add(StringRef str) { return add(llvm::xxh3_64bits(str)); }
++
++  uint64_t get() const { return llvm::xxh3_64bits(data); }
++
++private:
++  SmallVector<uint8_t, 64> data;
++};
++} // namespace
++
++/// Return a stable hash of the element data of the given ElementsAttr.
++static uint64_t hashElementsAttrContents(ElementsAttr attr) {
++  if (auto sparseAttr = dyn_cast<SparseElementsAttr>(attr)) {
++    return StableHasher()
++        .add(hashElementsAttrContents(sparseAttr.getIndices()))
++        .add(hashElementsAttrContents(sparseAttr.getValues()))
++        .get();
++  }
++  if (auto stringAttr = dyn_cast<DenseStringElementsAttr>(attr)) {
++    StableHasher hasher;
++    for (StringRef str : stringAttr.getRawStringData())
++      hasher.add(str.size()).add(str);
++    return hasher.get();
++  }
++  if (auto denseAttr = dyn_cast<DenseElementsAttr>(attr)) {
++    ArrayRef<char> rawData = denseAttr.getRawData();
++    return llvm::xxh3_64bits(ArrayRef(
++        reinterpret_cast<const uint8_t *>(rawData.data()), rawData.size()));
++  }
++  llvm_unreachable("unexpected kind of elided ElementsAttr");
++}
++
++namespace {
++/// Computes hashes of SSA values from the contents of the operations that
++/// define them, rather than from their position in the IR. These are used to
++/// derive SSA names that stay the same when unrelated operations are added or
++/// removed.
++///
++/// The hash of an operation at depth N combines the contents of the operation
++/// itself (name, attributes, types and nested regions) with the hashes at
++/// depth N-1 of the values it uses. Bounding the depth prevents a change to one
++/// operation from renaming every value downstream of it, so callers should use
++/// the smallest depth that still produces a unique name.
++class StableValueHasher {
++public:
++  explicit StableValueHasher(MLIRContext *context);
++
++  /// Return the hash of `value`, covering up to `depth` levels of operations
++  /// upstream of it.
++  uint64_t getValueHash(Value value, unsigned depth);
++
++private:
++  /// Return the hash of `op`, covering up to `depth` levels upstream of it.
++  uint64_t getOpHash(Operation *op, unsigned depth);
++
++  /// Return the hash of the contents of `op`, independent of its operands.
++  uint64_t getLocalOpHash(Operation *op);
++
++  /// Return a hash of the structure of `region`. Values defined inside the
++  /// region are identified by their position within it, values defined outside
++  /// of it only by their type.
++  uint64_t getRegionHash(Region &region);
++
++  /// Return a hash of the position and type of a block argument.
++  uint64_t getBlockArgHash(BlockArgument arg);
++
++  /// Attributes and types are hashed through their textual form, which unlike
++  /// their storage pointer does not change between runs.
++  uint64_t getAttrHash(Attribute attr);
++  uint64_t getTypeHash(Type type);
++
++  /// The state used to print attributes and types for hashing.
++  AsmState printState;
++
++  DenseMap<std::pair<Operation *, unsigned>, uint64_t> opHashes;
++  DenseMap<Operation *, uint64_t> localOpHashes;
++  DenseMap<Attribute, uint64_t> attrHashes;
++  DenseMap<Type, uint64_t> typeHashes;
++};
++} // namespace
++
++StableValueHasher::StableValueHasher(MLIRContext *context)
++    : printState(context, OpPrintingFlags()
++                              .elideLargeElementsAttrs()
++                              .elideLargeElementsAttrsWithHash()
++                              .enableDebugInfo(false)) {}
++
++uint64_t StableValueHasher::getValueHash(Value value, unsigned depth) {
++  if (auto result = dyn_cast<OpResult>(value)) {
++    return StableHasher()
++        .add(getOpHash(result.getOwner(), depth))
++        .add(result.getResultNumber())
++        .get();
++  }
++  return getBlockArgHash(cast<BlockArgument>(value));
++}
++
++uint64_t StableValueHasher::getOpHash(Operation *op, unsigned depth) {
++  if (depth == 0)
++    return getLocalOpHash(op);
++  auto key = std::make_pair(op, depth);
++  if (auto it = opHashes.find(key); it != opHashes.end())
++    return it->second;
++
++  StableHasher hasher;
++  hasher.add(getLocalOpHash(op));
++  for (Value operand : op->getOperands())
++    hasher.add(getValueHash(operand, depth - 1));
++  uint64_t hash = hasher.get();
++  opHashes[key] = hash;
++  return hash;
++}
++
++uint64_t StableValueHasher::getLocalOpHash(Operation *op) {
++  if (auto it = localOpHashes.find(op); it != localOpHashes.end())
++    return it->second;
++
++  StableHasher hasher;
++  hasher.add(op->getName().getStringRef());
++  hasher.add(getAttrHash(op->getAttrDictionary()));
++  hasher.add(op->getNumOperands());
++  for (Type type : op->getOperandTypes())
++    hasher.add(getTypeHash(type));
++  hasher.add(op->getNumResults());
++  for (Type type : op->getResultTypes())
++    hasher.add(getTypeHash(type));
++  hasher.add(op->getNumSuccessors());
++  hasher.add(op->getNumRegions());
++  for (Region &region : op->getRegions())
++    hasher.add(getRegionHash(region));
++  uint64_t hash = hasher.get();
++  localOpHashes[op] = hash;
++  return hash;
++}
++
++uint64_t StableValueHasher::getRegionHash(Region &region) {
++  // Number the values defined in the region in order of definition, so that
++  // uses of them can be identified without relying on names.
++  DenseMap<Value, uint64_t> localValueIds;
++  StableHasher hasher;
++  for (Block &block : region) {
++    hasher.add(block.getNumArguments());
++    for (BlockArgument arg : block.getArguments()) {
++      hasher.add(getTypeHash(arg.getType()));
++      localValueIds.try_emplace(arg, localValueIds.size());
++    }
++    for (Operation &op : block) {
++      hasher.add(getLocalOpHash(&op));
++      for (Value operand : op.getOperands()) {
++        auto it = localValueIds.find(operand);
++        hasher.add(it == localValueIds.end() ? ~uint64_t(0) : it->second);
++      }
++      for (Value result : op.getResults())
++        localValueIds.try_emplace(result, localValueIds.size());
++    }
++  }
++  return hasher.get();
++}
++
++uint64_t StableValueHasher::getBlockArgHash(BlockArgument arg) {
++  StableHasher hasher;
++  Block *block = arg.getOwner();
++  if (Region *region = block->getParent()) {
++    if (Operation *parentOp = region->getParentOp()) {
++      hasher.add(parentOp->getName().getStringRef());
++      hasher.add(region->getRegionNumber());
++    }
++    hasher.add(std::distance(region->begin(), block->getIterator()));
++  }
++  hasher.add(arg.getArgNumber());
++  hasher.add(getTypeHash(arg.getType()));
++  return hasher.get();
++}
++
++uint64_t StableValueHasher::getAttrHash(Attribute attr) {
++  if (auto it = attrHashes.find(attr); it != attrHashes.end())
++    return it->second;
++  std::string str;
++  llvm::raw_string_ostream os(str);
++  attr.print(os, printState);
++  uint64_t hash = llvm::xxh3_64bits(str);
++  attrHashes[attr] = hash;
++  return hash;
++}
++
++uint64_t StableValueHasher::getTypeHash(Type type) {
++  if (auto it = typeHashes.find(type); it != typeHashes.end())
++    return it->second;
++  std::string str;
++  llvm::raw_string_ostream os(str);
++  type.print(os, printState);
++  uint64_t hash = llvm::xxh3_64bits(str);
++  typeHashes[type] = hash;
++  return hash;
++}
++
+ //===----------------------------------------------------------------------===//
+ // SSANameState
+ //===----------------------------------------------------------------------===//
+@@ -1441,6 +1723,10 @@ private:
+   /// conflicts, it is automatically renamed.
+   StringRef uniqueValueName(StringRef name);
+ 
++  /// Returns a unique name for `value` derived from a hash of its definition,
++  /// prefixed with the given name hint, if any.
++  StringRef uniqueStableValueName(Value value, StringRef hint);
++
+   /// This is the value ID for each SSA value. If this returns NameSentinel,
+   /// then the valueID has an entry in valueNames.
+   DenseMap<Value, unsigned> valueIDs;
+@@ -1475,6 +1761,15 @@ private:
+   /// These are the printing flags.  They control, eg., whether to print in
+   /// generic form.
+   OpPrintingFlags printerFlags;
++
++  /// Computes the hashes used for stable value names. This is only set while
++  /// values are being numbered, and only if stable names are requested.
++  std::unique_ptr<StableValueHasher> stableHasher;
++
++  /// The value that each stable name was assigned to. Names are unique within
++  /// a scope, so for any name that is currently in use, this holds the value
++  /// visible under that name.
++  DenseMap<StringRef, Value> stableNameOwners;
+ };
+ } // namespace
+ 
+@@ -1483,6 +1778,8 @@ SSANameState::SSANameState(Operation *op, const OpPrintingFlags &printerFlags)
+   llvm::SaveAndRestore valueIDSaver(nextValueID);
+   llvm::SaveAndRestore argumentIDSaver(nextArgumentID);
+   llvm::SaveAndRestore conflictIDSaver(nextConflictID);
++  if (printerFlags.shouldPrintStableSSANames())
++    stableHasher = std::make_unique<StableValueHasher>(op->getContext());
+ 
+   // The naming context includes `nextValueID`, `nextArgumentID`,
+   // `nextConflictID` and `usedNames` scoped HashTable. This information is
+@@ -1541,6 +1838,8 @@ SSANameState::SSANameState(Operation *op, const OpPrintingFlags &printerFlags)
+   // Manually remove all the scopes.
+   while (usedNames.getCurScope() != nullptr)
+     usedNames.getCurScope()->~UsedNamesScopeTy();
++
++  stableHasher.reset();
+ }
+ 
+ void SSANameState::printValueID(Value value, bool printResultNo,
+@@ -1779,9 +2078,14 @@ void SSANameState::numberValuesInOp(Operation &op) {
+     }
+   }
+ 
+-  // If the first result wasn't numbered, give it a default number.
+-  if (valueIDs.try_emplace(resultBegin, nextValueID).second)
++  // If the first result wasn't numbered, give it a default number, or a name
++  // derived from its definition when printing stable names.
++  if (printerFlags.shouldPrintStableSSANames()) {
++    if (!valueIDs.count(resultBegin))
++      setValueName(resultBegin, /*name=*/"");
++  } else if (valueIDs.try_emplace(resultBegin, nextValueID).second) {
+     ++nextValueID;
++  }
+ 
+   // If this operation has multiple result groups, mark it.
+   if (resultGroups.size() != 1) {
+@@ -1830,6 +2134,16 @@ void SSANameState::getResultIDAndNumber(
+ }
+ 
+ void SSANameState::setValueName(Value value, StringRef name) {
++  // When printing stable names, operation results and values that would
++  // otherwise be numbered are named after their definition, with the name, if
++  // any, used as a prefix.
++  if (printerFlags.shouldPrintStableSSANames() &&
++      (isa<OpResult>(value) || name.empty())) {
++    valueIDs[value] = NameSentinel;
++    valueNames[value] = uniqueStableValueName(value, name);
++    return;
++  }
++
+   // If the name is empty, the value uses the default numbering.
+   if (name.empty()) {
+     valueIDs[value] = nextValueID++;
+@@ -1853,8 +2167,14 @@ StringRef SSANameState::uniqueValueName(StringRef name) {
+     // generates new names by incrementing nextConflictID.
+     SmallString<64> probeName(name);
+     probeName.push_back('_');
++    // When printing stable names, number conflicts per name so that the
++    // suffix does not depend on unrelated conflicts elsewhere in the IR.
++    unsigned localConflictID = 1;
++    unsigned &conflictID = printerFlags.shouldPrintStableSSANames()
++                               ? localConflictID
++                               : nextConflictID;
+     while (true) {
+-      probeName += llvm::utostr(nextConflictID++);
++      probeName += llvm::utostr(conflictID++);
+       if (!usedNames.count(probeName)) {
+         name = probeName.str().copy(usedNameAllocator);
+         break;
+@@ -1867,6 +2187,58 @@ StringRef SSANameState::uniqueValueName(StringRef name) {
+   return name;
+ }
+ 
++StringRef SSANameState::uniqueStableValueName(Value value, StringRef hint) {
++  assert(stableHasher && "stable names are only assigned during numbering");
++  SmallString<16> hintBuffer;
++  if (!hint.empty())
++    hint = sanitizeIdentifier(hint, hintBuffer);
++
++  // Names that are not entirely numeric must not start with a digit, so values
++  // without a name hint get a letter prefix.
++  auto getName = [&](unsigned depth) {
++    std::string name;
++    llvm::raw_string_ostream os(name);
++    if (hint.empty())
++      os << 'v';
++    else
++      os << hint << '_';
++    uint64_t hash = stableHasher->getValueHash(value, depth);
++    os << llvm::format_hex_no_prefix(static_cast<uint32_t>(hash), 8);
++    return name;
++  };
++
++  // On a collision, retry with hashes covering more levels upstream. This
++  // tells apart values that only differ further away from their definition,
++  // without making their names depend on the order they appear in.
++  constexpr unsigned kMaxExtraDepth = 8;
++  unsigned minDepth = printerFlags.getStableSSANameDepth();
++  unsigned maxDepth = minDepth + kMaxExtraDepth;
++  std::string name;
++  std::optional<std::string> duplicateName;
++  for (unsigned depth = minDepth; depth <= maxDepth; ++depth) {
++    name = getName(depth);
++    if (!usedNames.count(name)) {
++      duplicateName.reset();
++      break;
++    }
++    // Remember the first name that is taken by a value that is identical to
++    // this one up to the maximum depth.
++    if (duplicateName)
++      continue;
++    Value owner = stableNameOwners.lookup(name);
++    if (owner && stableHasher->getValueHash(owner, maxDepth) ==
++                     stableHasher->getValueHash(value, maxDepth))
++      duplicateName = name;
++  }
++
++  // If the collision could not be resolved, the values are likely identical.
++  // Fall back to adding a numeric suffix to the name of the first duplicate,
++  // which keeps duplicates under a common, and shallow, name.
++  StringRef uniqueName = uniqueValueName(duplicateName.value_or(name));
++  stableNameOwners[uniqueName] = value;
++  return uniqueName;
++}
++
+ //===----------------------------------------------------------------------===//
+ // DistinctState
+ //===----------------------------------------------------------------------===//
+@@ -2396,8 +2768,16 @@ static void printSymbolReference(StringRef symbolRef, raw_ostream &os) {
+ //
+ // We choose to use a dense resource ElementsAttr literal with conspicuous
+ // content to hopefully alert readers to the fact that this has been elided.
+-static void printElidedElementsAttr(raw_ostream &os) {
+-  os << R"(dense_resource<__elided__>)";
++// If requested, a hash of the contents is embedded in the resource name so
++// that elided attributes with different contents can still be told apart.
++static void printElidedElementsAttr(raw_ostream &os, ElementsAttr attr,
++                                    const OpPrintingFlags &printerFlags) {
++  if (!printerFlags.shouldElideElementsAttrWithHash()) {
++    os << R"(dense_resource<__elided__>)";
++    return;
++  }
++  os << "dense_resource<__elided_"
++     << llvm::format_hex_no_prefix(hashElementsAttrContents(attr), 16) << "__>";
+ }
+ 
+ void AsmPrinter::Impl::printResourceHandle(
+@@ -2518,7 +2898,7 @@ void AsmPrinter::Impl::printAttributeImpl(Attribute attr,
+   } else if (auto intOrFpEltAttr =
+                  llvm::dyn_cast<DenseTypedElementsAttr>(attr)) {
+     if (printerFlags.shouldElideElementsAttr(intOrFpEltAttr)) {
+-      printElidedElementsAttr(os);
++      printElidedElementsAttr(os, intOrFpEltAttr, printerFlags);
+     } else {
+       os << "dense<";
+       // Check if the element type implements DenseElementTypeInterface and is
+@@ -2537,7 +2917,7 @@ void AsmPrinter::Impl::printAttributeImpl(Attribute attr,
+ 
+   } else if (auto strEltAttr = llvm::dyn_cast<DenseStringElementsAttr>(attr)) {
+     if (printerFlags.shouldElideElementsAttr(strEltAttr)) {
+-      printElidedElementsAttr(os);
++      printElidedElementsAttr(os, strEltAttr, printerFlags);
+     } else {
+       os << "dense<";
+       printDenseStringElementsAttr(strEltAttr);
+@@ -2547,7 +2927,7 @@ void AsmPrinter::Impl::printAttributeImpl(Attribute attr,
+   } else if (auto sparseEltAttr = llvm::dyn_cast<SparseElementsAttr>(attr)) {
+     if (printerFlags.shouldElideElementsAttr(sparseEltAttr.getIndices()) ||
+         printerFlags.shouldElideElementsAttr(sparseEltAttr.getValues())) {
+-      printElidedElementsAttr(os);
++      printElidedElementsAttr(os, sparseEltAttr, printerFlags);
+     } else {
+       os << "sparse<";
+       DenseIntElementsAttr indices = sparseEltAttr.getIndices();
+@@ -3556,6 +3936,27 @@ void OperationPrinter::printResourceFileMetadata(
+   auto processProvider = [&](StringRef dictName, StringRef name, auto &provider,
+                              auto &&...providerArgs) {
+     bool hadEntry = false;
++    // Emit the top-level resource entry and the parent resource entry if we
++    // haven't yet. Returns true if the parent entry already had an entry.
++    auto emitEntryHeaders = [&]() {
++      if (!std::exchange(hadResource, true)) {
++        if (needResourceComma)
++          os << "," << newLine;
++        os << "  " << dictName << "_resources: {" << newLine;
++      }
++      if (std::exchange(hadEntry, true))
++        return true;
++      if (needEntryComma)
++        os << "," << newLine;
++      os << "    " << name << ": {" << newLine;
++      return false;
++    };
++
++    // Elided resources that are printed as comments. These are emitted after
++    // all other entries, as comments cannot be placed between an entry and the
++    // comma that follows it.
++    SmallVector<std::string> elidedComments;
++    bool elideWithHash = printerFlags.shouldElideResourceStringWithHash();
+     auto printFn = [&](StringRef key, ResourceBuilder::ValueFn valueFn) {
+       checkAddMetadataDict();
+ 
+@@ -3564,35 +3965,34 @@ void OperationPrinter::printResourceFileMetadata(
+       std::optional<uint64_t> charLimit =
+           printerFlags.getLargeResourceStringLimit();
+       if (charLimit.has_value()) {
+-        // Don't compute resourceStr when charLimit is 0.
+-        if (charLimit.value() == 0)
++        // Don't compute resourceStr when charLimit is 0, unless it needs to
++        // be hashed.
++        if (charLimit.value() == 0 && !elideWithHash)
+           return;
+ 
+         llvm::raw_string_ostream ss(resourceStr);
+         valueFn(ss);
+ 
+         // Only print entry if its string is small enough.
+-        if (resourceStr.size() > charLimit.value())
++        if (resourceStr.size() > charLimit.value()) {
++          if (elideWithHash) {
++            std::string &comment = elidedComments.emplace_back();
++            llvm::raw_string_ostream commentOS(comment);
++            ::printKeywordOrString(key, commentOS);
++            commentOS << ": __elided_"
++                      << llvm::format_hex_no_prefix(
++                             llvm::xxh3_64bits(resourceStr), 16)
++                      << "__";
++          }
+           return;
++        }
+ 
+         // Don't recompute resourceStr when valueFn is called below.
+         valueFn = printResourceStr;
+       }
+ 
+-      // Emit the top-level resource entry if we haven't yet.
+-      if (!std::exchange(hadResource, true)) {
+-        if (needResourceComma)
+-          os << "," << newLine;
+-        os << "  " << dictName << "_resources: {" << newLine;
+-      }
+-      // Emit the parent resource entry if we haven't yet.
+-      if (!std::exchange(hadEntry, true)) {
+-        if (needEntryComma)
+-          os << "," << newLine;
+-        os << "    " << name << ": {" << newLine;
+-      } else {
++      if (emitEntryHeaders())
+         os << "," << newLine;
+-      }
+       os << "      ";
+       ::printKeywordOrString(key, os);
+       os << ": ";
+@@ -3602,6 +4002,15 @@ void OperationPrinter::printResourceFileMetadata(
+     ResourceBuilder entryBuilder(printFn);
+     provider.buildResources(op, providerArgs..., entryBuilder);
+ 
++    if (!elidedComments.empty()) {
++      bool needNewLine = emitEntryHeaders();
++      for (const std::string &comment : elidedComments) {
++        if (std::exchange(needNewLine, true))
++          os << newLine;
++        os << "      // " << comment;
++      }
++    }
++
+     needEntryComma |= hadEntry;
+     if (hadEntry)
+       os << newLine << "    }";
+diff --git a/third_party/llvm-project/mlir/lib/Transforms/CMakeLists.txt b/third_party/llvm-project/mlir/lib/Transforms/CMakeLists.txt
+index 890772462..218555fa1 100644
+--- a/third_party/llvm-project/mlir/lib/Transforms/CMakeLists.txt
++++ b/third_party/llvm-project/mlir/lib/Transforms/CMakeLists.txt
+@@ -16,6 +16,7 @@ add_mlir_library(MLIRTransforms
+   RemoveDeadValues.cpp
+   SCCP.cpp
+   SROA.cpp
++  StabilizePrivateFuncNames.cpp
+   StripDebugInfo.cpp
+   SymbolDCE.cpp
+   SymbolPrivatize.cpp
 diff --git a/third_party/llvm-project/mlir/test/Dialect/Linalg/vectorization/extract.mlir b/third_party/llvm-project/mlir/test/Dialect/Linalg/vectorization/extract.mlir
 index 76ac4b839..fc0a11ef9 100644
 --- a/third_party/llvm-project/mlir/test/Dialect/Linalg/vectorization/extract.mlir
