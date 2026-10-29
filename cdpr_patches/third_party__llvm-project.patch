@@ -1,5 +1,5 @@
 # Submodule: third_party/llvm-project
-# Generated: 2026-10-28T23:45:16Z
+# Generated: 2026-10-29T19:07:02Z
 
 ## Uncommitted changes ##
 diff --git a/third_party/llvm-project/mlir/include/mlir/IR/OperationSupport.h b/third_party/llvm-project/mlir/include/mlir/IR/OperationSupport.h
@@ -884,6 +884,179 @@ index 890772462..218555fa1 100644
    StripDebugInfo.cpp
    SymbolDCE.cpp
    SymbolPrivatize.cpp
+diff --git a/third_party/llvm-project/mlir/lib/Transforms/StabilizePrivateFuncNames.cpp b/third_party/llvm-project/mlir/lib/Transforms/StabilizePrivateFuncNames.cpp
+new file mode 100644
+index 000000000..12429685f
+--- /dev/null
++++ b/third_party/llvm-project/mlir/lib/Transforms/StabilizePrivateFuncNames.cpp
+@@ -0,0 +1,167 @@
++//===- StabilizePrivateFuncNames.cpp - Content based function names -------===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++//
++// This file implements a pass that renames private functions to names derived
++// from their contents, so that the names do not depend on creation order.
++//
++//===----------------------------------------------------------------------===//
++
++#include "mlir/Transforms/Passes.h"
++
++#include "mlir/IR/AttrTypeSubElements.h"
++#include "mlir/IR/BuiltinAttributes.h"
++#include "mlir/IR/SymbolTable.h"
++#include "mlir/Interfaces/FunctionInterfaces.h"
++#include "llvm/ADT/StringExtras.h"
++#include "llvm/ADT/StringSet.h"
++#include "llvm/Support/Format.h"
++#include "llvm/Support/xxhash.h"
++
++namespace mlir {
++#define GEN_PASS_DEF_STABILIZEPRIVATEFUNCNAMESPASS
++#include "mlir/Transforms/Passes.h.inc"
++} // namespace mlir
++
++using namespace mlir;
++
++/// Return `name` without the trailing `_N` suffixes that are commonly added to
++/// make names unique. Suffixes of 8 hexadecimal digits are removed as well, as
++/// those are the hashes added by this pass, which keeps the pass idempotent.
++static StringRef stripUniquingSuffixes(StringRef name) {
++  while (true) {
++    auto [prefix, suffix] = name.rsplit('_');
++    if (prefix.empty() || suffix.empty() || prefix.size() == name.size())
++      return name;
++    bool isNumeric = llvm::all_of(suffix, llvm::isDigit);
++    bool isHash = suffix.size() == 8 && llvm::all_of(suffix, llvm::isHexDigit);
++    if (!isNumeric && !isHash)
++      return name;
++    name = prefix;
++  }
++}
++
++/// Add a replacement to `replacer` that renames references to the symbols in
++/// `newNames`.
++static void addSymbolRenames(AttrTypeReplacer &replacer,
++                             const DenseMap<StringAttr, StringAttr> &newNames) {
++  replacer.addReplacement(
++      [&newNames](SymbolRefAttr ref) -> std::optional<Attribute> {
++        auto it = newNames.find(ref.getRootReference());
++        if (it == newNames.end())
++          return std::nullopt;
++        return SymbolRefAttr::get(it->second, ref.getNestedReferences());
++      });
++}
++
++namespace {
++struct StabilizePrivateFuncNames
++    : public impl::StabilizePrivateFuncNamesPassBase<
++          StabilizePrivateFuncNames> {
++  void runOnOperation() override;
++
++  /// Rename the private functions directly nested in `symbolTableOp`.
++  void renameFunctionsIn(Operation *symbolTableOp);
++};
++} // namespace
++
++void StabilizePrivateFuncNames::runOnOperation() {
++  getOperation()->walk([&](Operation *op) {
++    if (op->hasTrait<OpTrait::SymbolTable>())
++      renameFunctionsIn(op);
++  });
++}
++
++void StabilizePrivateFuncNames::renameFunctionsIn(Operation *symbolTableOp) {
++  // Collect the private functions, and the names of all other symbols, which
++  // must not be reused.
++  SmallVector<FunctionOpInterface> funcs;
++  llvm::StringSet<> usedNames;
++  for (Operation &op : symbolTableOp->getRegion(0).getOps()) {
++    auto symbol = dyn_cast<SymbolOpInterface>(op);
++    if (!symbol)
++      continue;
++    auto func = dyn_cast<FunctionOpInterface>(op);
++    if (func && symbol.isPrivate())
++      funcs.push_back(func);
++    else
++      usedNames.insert(symbol.getName());
++  }
++  if (funcs.empty())
++    return;
++
++  MLIRContext *context = symbolTableOp->getContext();
++  DenseMap<StringAttr, StringAttr> baseNames;
++  for (FunctionOpInterface func : funcs) {
++    baseNames[func.getNameAttr()] =
++        StringAttr::get(context, stripUniquingSuffixes(func.getName()));
++  }
++
++  // References to private functions are hashed by their base name, so that
++  // the hash of a function does not change when its callees are renamed.
++  AttrTypeReplacer baseNameReplacer;
++  addSymbolRenames(baseNameReplacer, baseNames);
++
++  // Functions are hashed through their printed form. Override the printing
++  // options that may be set on the command line and affect that form. Large
++  // constants are elided with a hash of their contents to keep this cheap.
++  OpPrintingFlags flags;
++  flags.enableDebugInfo(false)
++      .printGenericOpForm(false)
++      .skipRegions(false)
++      .printValueUsers(false)
++      .printUniqueSSAIDs(false)
++      .printNameLocAsPrefix(false)
++      .printStableSSANames(false)
++      .elideLargeElementsAttrs()
++      .elideLargeElementsAttrsWithHash()
++      .useLocalScope()
++      .assumeVerified();
++
++  DenseMap<StringAttr, StringAttr> newNames;
++  for (FunctionOpInterface func : funcs) {
++    Operation *clone = func->clone();
++    baseNameReplacer.recursivelyReplaceElementsIn(clone, /*replaceAttrs=*/true,
++                                                  /*replaceLocs=*/false,
++                                                  /*replaceTypes=*/false);
++    // The name of the function itself is not part of its contents.
++    SymbolTable::setSymbolName(clone, "");
++    std::string str;
++    llvm::raw_string_ostream os(str);
++    clone->print(os, flags);
++    clone->erase();
++
++    StringAttr baseName = baseNames.lookup(func.getNameAttr());
++    std::string name;
++    llvm::raw_string_ostream(name)
++        << baseName.getValue() << '_'
++        << llvm::format_hex_no_prefix(
++               static_cast<uint32_t>(llvm::xxh3_64bits(str)), 8);
++    // Identical functions get the same name, so tell them apart in order.
++    std::string uniqueName = name;
++    for (unsigned i = 1; !usedNames.insert(uniqueName).second; ++i)
++      uniqueName = name + "_" + std::to_string(i);
++    newNames[func.getNameAttr()] = StringAttr::get(context, uniqueName);
++  }
++
++  // Rename all references at once, so that a new name may be equal to the old
++  // name of another function. References within nested symbol tables refer to
++  // the symbols of that table instead, so those are skipped.
++  AttrTypeReplacer renamer;
++  addSymbolRenames(renamer, newNames);
++  symbolTableOp->walk<WalkOrder::PreOrder>([&](Operation *op) {
++    if (op == symbolTableOp)
++      return WalkResult::advance();
++    renamer.replaceElementsIn(op, /*replaceAttrs=*/true, /*replaceLocs=*/false,
++                              /*replaceTypes=*/false);
++    if (op->hasTrait<OpTrait::SymbolTable>())
++      return WalkResult::skip();
++    return WalkResult::advance();
++  });
++  for (FunctionOpInterface func : funcs)
++    func.setName(newNames.lookup(func.getNameAttr()));
++}
 diff --git a/third_party/llvm-project/mlir/test/Dialect/Linalg/vectorization/extract.mlir b/third_party/llvm-project/mlir/test/Dialect/Linalg/vectorization/extract.mlir
 index 76ac4b839..fc0a11ef9 100644
 --- a/third_party/llvm-project/mlir/test/Dialect/Linalg/vectorization/extract.mlir
@@ -1046,4 +1219,367 @@ index 7a60ff8ea..346f4129f 100644
  // ============================================================================
  //  TD sequence
  // ============================================================================
-
+diff --git a/third_party/llvm-project/mlir/test/IR/pretty-attributes-elide-with-hash.mlir b/third_party/llvm-project/mlir/test/IR/pretty-attributes-elide-with-hash.mlir
+new file mode 100644
+index 000000000..9c713ff78
+--- /dev/null
++++ b/third_party/llvm-project/mlir/test/IR/pretty-attributes-elide-with-hash.mlir
+@@ -0,0 +1,38 @@
++// RUN: mlir-opt %s -allow-unregistered-dialect -mlir-elide-elementsattrs-if-larger=2 -mlir-elide-elementsattrs-with-hash | FileCheck %s
++// Ensure that the elided version is still parseable.
++// RUN: mlir-opt %s -allow-unregistered-dialect -mlir-elide-elementsattrs-if-larger=2 -mlir-elide-elementsattrs-with-hash | mlir-opt -allow-unregistered-dialect
++
++// Elided attributes carry a hash of their contents, so identical contents
++// produce identical output and different contents produce different output.
++
++// CHECK: "test.dense_attr"() {foo.dense_attr = dense_resource<__elided_[[HASH_A:[0-9a-f]{16}]]__> : tensor<3xi32>}
++"test.dense_attr"() {foo.dense_attr = dense<[1, 2, 3]> : tensor<3xi32>} : () -> ()
++
++// CHECK: "test.dense_attr"() {foo.dense_attr = dense_resource<__elided_[[HASH_A]]__> : tensor<3xi32>}
++"test.dense_attr"() {foo.dense_attr = dense<[1, 2, 3]> : tensor<3xi32>} : () -> ()
++
++// CHECK-NOT: [[HASH_A]]
++// CHECK: "test.dense_attr"() {foo.dense_attr = dense_resource<__elided_[[OTHER_1:[0-9a-f]{16}]]__> : tensor<3xi32>}
++"test.dense_attr"() {foo.dense_attr = dense<[1, 2, 4]> : tensor<3xi32>} : () -> ()
++
++// CHECK: "test.string_attr"() {foo.string_attr = dense_resource<__elided_[[HASH_B:[0-9a-f]{16}]]__> : tensor<3x!foo.string>}
++"test.string_attr"() {foo.string_attr = dense<["a", "b", "c"]> : tensor<3x!foo.string>} : () -> ()
++
++// CHECK-NOT: [[HASH_B]]
++// CHECK: "test.string_attr"() {foo.string_attr = dense_resource<__elided_[[OTHER_2:[0-9a-f]{16}]]__> : tensor<3x!foo.string>}
++"test.string_attr"() {foo.string_attr = dense<["a", "bc", ""]> : tensor<3x!foo.string>} : () -> ()
++
++// CHECK: "test.sparse_attr"() {foo.sparse_attr = dense_resource<__elided_[[HASH_C:[0-9a-f]{16}]]__> : vector<1x1x10xf16>}
++"test.sparse_attr"() {foo.sparse_attr = sparse<[[0, 0, 5]],  -2.0> : vector<1x1x10xf16>} : () -> ()
++
++// CHECK-NOT: [[HASH_C]]
++// CHECK: "test.sparse_attr"() {foo.sparse_attr = dense_resource<__elided_[[OTHER_3:[0-9a-f]{16}]]__> : vector<1x1x10xf16>}
++"test.sparse_attr"() {foo.sparse_attr = sparse<[[0, 0, 6]],  -2.0> : vector<1x1x10xf16>} : () -> ()
++
++// Attributes below the limit and splats are printed as usual.
++
++// CHECK: dense<[1, 2]> : tensor<2xi32>
++"test.non_elided_dense_attr"() {foo.dense_attr = dense<[1, 2]> : tensor<2xi32>} : () -> ()
++
++// CHECK: dense<1> : tensor<3xi32>
++"test.dense_splat"() {foo.dense_attr = dense<1> : tensor<3xi32>} : () -> ()
+diff --git a/third_party/llvm-project/mlir/test/IR/pretty-resources-print-with-hash.mlir b/third_party/llvm-project/mlir/test/IR/pretty-resources-print-with-hash.mlir
+new file mode 100644
+index 000000000..fcb776037
+--- /dev/null
++++ b/third_party/llvm-project/mlir/test/IR/pretty-resources-print-with-hash.mlir
+@@ -0,0 +1,61 @@
++// Check printing with --mlir-elide-resource-strings-with-hash replaces elided
++// resources by a comment with a hash of their value.
++
++// RUN: mlir-opt %s -allow-unregistered-dialect --mlir-elide-resource-strings-if-larger=20 --mlir-elide-resource-strings-with-hash | FileCheck %s
++// Ensure that the elided version is still parseable.
++// RUN: mlir-opt %s -allow-unregistered-dialect --mlir-elide-resource-strings-if-larger=20 --mlir-elide-resource-strings-with-hash | mlir-opt -allow-unregistered-dialect
++
++// CHECK: attr = dense_resource<blob1> : tensor<3xi64>
++"test.blob1op"() {attr = dense_resource<blob1> : tensor<3xi64> } : () -> ()
++
++// CHECK-NEXT: attr = dense_resource<blob2> : tensor<3xi64>
++"test.blob2op"() {attr = dense_resource<blob2> : tensor<3xi64> } : () -> ()
++
++// CHECK-NEXT: attr = dense_resource<blob3> : tensor<3xi64>
++"test.blob3op"() {attr = dense_resource<blob3> : tensor<3xi64> } : () -> ()
++
++// CHECK-NEXT: attr = dense_resource<small> : tensor<1xi8>
++"test.smallop"() {attr = dense_resource<small> : tensor<1xi8> } : () -> ()
++
++// Resources that are small enough are printed as usual, before the comments
++// for the elided ones. Identical values produce identical hashes.
++
++// CHECK:      {-#
++// CHECK-NEXT:   dialect_resources: {
++// CHECK-NEXT:     builtin: {
++// CHECK-NEXT:       small: "0x0100000001"
++// CHECK-NEXT:       // blob1: __elided_[[HASH1:[0-9a-f]{16}]]__
++// CHECK-NEXT:       // blob2: __elided_[[HASH2:[0-9a-f]{16}]]__
++// CHECK-NEXT:       // blob3: __elided_[[HASH1]]__
++// CHECK-NEXT:     }
++// CHECK-NEXT:   },
++// CHECK-NEXT:   external_resources: {
++// CHECK-NEXT:     external: {
++// CHECK-NEXT:       bool: true
++// CHECK-NEXT:       // blob: __elided_[[HASH1]]__
++// CHECK-NEXT:     },
++// CHECK-NEXT:     other_stuff: {
++// CHECK-NEXT:       // blob: __elided_[[HASH2]]__
++// CHECK-NEXT:     }
++// CHECK-NEXT:   }
++// CHECK-NEXT: #-}
++
++{-#
++  dialect_resources: {
++    builtin: {
++      blob1: "0x08000000010000000000000002000000000000000300000000000000",
++      blob2: "0x08000000040000000000000005000000000000000600000000000000",
++      blob3: "0x08000000010000000000000002000000000000000300000000000000",
++      small: "0x0100000001"
++    }
++  },
++  external_resources: {
++    external: {
++      blob: "0x08000000010000000000000002000000000000000300000000000000",
++      bool: true
++    },
++    other_stuff: {
++      blob: "0x08000000040000000000000005000000000000000600000000000000"
++    }
++  }
++#-}
+diff --git a/third_party/llvm-project/mlir/test/IR/print-stable-ssa-names.mlir b/third_party/llvm-project/mlir/test/IR/print-stable-ssa-names.mlir
+new file mode 100644
+index 000000000..c49ae2a07
+--- /dev/null
++++ b/third_party/llvm-project/mlir/test/IR/print-stable-ssa-names.mlir
+@@ -0,0 +1,116 @@
++// RUN: mlir-opt -allow-unregistered-dialect -mlir-print-stable-ssa-names %s | FileCheck %s
++// RUN: mlir-opt -allow-unregistered-dialect -mlir-print-stable-ssa-names -mlir-stable-ssa-name-depth=1 %s | FileCheck %s --check-prefix=DEPTH1
++// Ensure that the output is still parseable and prints identically again.
++// RUN: mlir-opt -allow-unregistered-dialect -mlir-print-stable-ssa-names %s > %t
++// RUN: mlir-opt -allow-unregistered-dialect -mlir-print-stable-ssa-names %t | diff %t -
++
++// Names do not depend on the position of a value, so adding an unrelated
++// operation does not rename the values after it.
++
++// CHECK-LABEL: func @position
++// CHECK: %[[ADD:v[0-9a-f]{8}]] = arith.addi %arg0, %arg1 : i32
++// CHECK: %[[MUL:v[0-9a-f]{8}]] = arith.muli %[[ADD]], %[[ADD]] : i32
++// CHECK: return %[[MUL]] : i32
++func.func @position(%arg0: i32, %arg1: i32) -> i32 {
++  %0 = arith.addi %arg0, %arg1 : i32
++  %1 = arith.muli %0, %0 : i32
++  return %1 : i32
++}
++
++// CHECK-LABEL: func @position_with_extra_op
++// CHECK: arith.subi %arg0, %arg1 : i32
++// CHECK: %[[ADD]] = arith.addi %arg0, %arg1 : i32
++// CHECK: %[[MUL]] = arith.muli %[[ADD]], %[[ADD]] : i32
++// CHECK: return %[[MUL]] : i32
++func.func @position_with_extra_op(%arg0: i32, %arg1: i32) -> i32 {
++  %0 = arith.subi %arg0, %arg1 : i32
++  %1 = arith.addi %arg0, %arg1 : i32
++  %2 = arith.muli %1, %1 : i32
++  "test.use"(%0) : (i32) -> ()
++  return %2 : i32
++}
++
++// A change to an operation only renames the values up to the given depth
++// downstream of it.
++
++// CHECK-LABEL: func @chain
++// CHECK: %[[X:v[0-9a-f]{8}]] = arith.addi %arg0, %arg1 : i32
++// CHECK: %[[Y:v[0-9a-f]{8}]] = arith.muli %[[X]], %[[X]] : i32
++// CHECK: %[[Z:v[0-9a-f]{8}]] = arith.subi %[[Y]], %[[Y]] : i32
++// DEPTH1-LABEL: func @chain
++// DEPTH1: %[[X:v[0-9a-f]{8}]] = arith.addi %arg0, %arg1 : i32
++// DEPTH1: %[[Y:v[0-9a-f]{8}]] = arith.muli %[[X]], %[[X]] : i32
++// DEPTH1: %[[Z:v[0-9a-f]{8}]] = arith.subi %[[Y]], %[[Y]] : i32
++func.func @chain(%arg0: i32, %arg1: i32) -> i32 {
++  %0 = arith.addi %arg0, %arg1 : i32
++  %1 = arith.muli %0, %0 : i32
++  %2 = arith.subi %1, %1 : i32
++  return %2 : i32
++}
++
++// CHECK-LABEL: func @chain_changed
++// CHECK: %[[X2:v[0-9a-f]{8}]] = arith.ori %arg0, %arg1 : i32
++// CHECK: %[[Y]] = arith.muli %[[X2]], %[[X2]] : i32
++// CHECK: %[[Z]] = arith.subi %[[Y]], %[[Y]] : i32
++// DEPTH1-LABEL: func @chain_changed
++// DEPTH1: %[[X2:v[0-9a-f]{8}]] = arith.ori %arg0, %arg1 : i32
++// DEPTH1-NOT: %[[Y]] =
++// DEPTH1: %[[Z]] = arith.subi
++func.func @chain_changed(%arg0: i32, %arg1: i32) -> i32 {
++  %0 = arith.ori %arg0, %arg1 : i32
++  %1 = arith.muli %0, %0 : i32
++  %2 = arith.subi %1, %1 : i32
++  return %2 : i32
++}
++
++// Name hints from OpAsmOpInterface are used as a prefix.
++
++// CHECK-LABEL: func @hints
++// CHECK: %[[C0:c0_[0-9a-f]{8}]] = arith.constant 0 : index
++// CHECK: %[[C1:c1_[0-9a-f]{8}]] = arith.constant 1 : index
++// CHECK: %[[CST:cst_[0-9a-f]{8}]] = arith.constant 1.000000e+00 : f32
++// CHECK: %[[CST2:cst_[0-9a-f]{8}]] = arith.constant 2.000000e+00 : f32
++// CHECK: "test.use"(%[[C0]], %[[C1]], %[[CST]], %[[CST2]])
++func.func @hints() {
++  %c0 = arith.constant 0 : index
++  %c1 = arith.constant 1 : index
++  %cst = arith.constant 1.0 : f32
++  %cst_0 = arith.constant 2.0 : f32
++  "test.use"(%c0, %c1, %cst, %cst_0) : (index, index, f32, f32) -> ()
++  return
++}
++
++// Values whose operations only differ further upstream get distinct names
++// without a numeric suffix. Identical values fall back to a suffix.
++
++// CHECK-LABEL: func @collisions
++// CHECK: %[[NEG1:v[0-9a-f]{8}]] = arith.negf %cst
++// CHECK: %[[NEG2:v[0-9a-f]{8}]] = arith.negf %cst
++// CHECK: %[[DUP:v[0-9a-f]{8}]] = arith.negf %arg0
++// CHECK: %[[DUP]]_1 = arith.negf %arg0
++func.func @collisions(%arg0: f32) {
++  %cst = arith.constant 1.0 : f32
++  %cst_0 = arith.constant 2.0 : f32
++  %0 = arith.negf %cst : f32
++  %1 = arith.negf %cst_0 : f32
++  %2 = arith.negf %arg0 : f32
++  %3 = arith.negf %arg0 : f32
++  "test.use"(%0, %1, %2, %3) : (f32, f32, f32, f32) -> ()
++  return
++}
++
++// Multiple results and nested regions.
++
++// CHECK-LABEL: func @results_and_regions
++// CHECK: %[[RES:v[0-9a-f]{8}]]:2 = "test.two_results"()
++// CHECK: scf.for %[[IV:arg[0-9]+]] =
++// CHECK:   %[[INNER:v[0-9a-f]{8}]] = arith.addi %[[RES]]#0, %[[RES]]#1 : i32
++// CHECK:   "test.use"(%[[IV]], %[[INNER]])
++func.func @results_and_regions(%lb: index, %ub: index, %step: index) {
++  %0:2 = "test.two_results"() : () -> (i32, i32)
++  scf.for %iv = %lb to %ub step %step {
++    %1 = arith.addi %0#0, %0#1 : i32
++    "test.use"(%iv, %1) : (index, i32) -> ()
++  }
++  return
++}
+diff --git a/third_party/llvm-project/mlir/test/Transforms/stabilize-private-func-names.mlir b/third_party/llvm-project/mlir/test/Transforms/stabilize-private-func-names.mlir
+new file mode 100644
+index 000000000..459b2d4a7
+--- /dev/null
++++ b/third_party/llvm-project/mlir/test/Transforms/stabilize-private-func-names.mlir
+@@ -0,0 +1,125 @@
++// RUN: mlir-opt %s -split-input-file -stabilize-private-func-names | FileCheck %s
++// Running the pass again does not change the names.
++// RUN: mlir-opt %s -split-input-file -stabilize-private-func-names > %t
++// RUN: mlir-opt %t -split-input-file -stabilize-private-func-names | diff %t -
++
++// Private functions are renamed to their name without numeric suffix, followed
++// by a hash of their contents. Other functions keep their names.
++
++// CHECK-LABEL: module @first
++// CHECK: func.func @main(
++// CHECK:   call @[[FOO_ADD:foo_[0-9a-f]{8}]](
++// CHECK:   call @[[FOO_MUL:foo_[0-9a-f]{8}]](
++// CHECK:   call @[[BAR:bar_[0-9a-f]{8}]](
++// CHECK: func.func private @[[FOO_ADD]](
++// CHECK: func.func private @[[FOO_MUL]](
++// CHECK: func.func private @[[BAR]](
++// CHECK:   call @[[FOO_ADD]](
++// CHECK: func.func @public_7(
++module @first {
++  func.func @main(%arg0: i32) -> i32 {
++    %0 = call @foo_3(%arg0) : (i32) -> i32
++    %1 = call @foo_12(%0) : (i32) -> i32
++    %2 = call @bar_5(%1) : (i32) -> i32
++    return %2 : i32
++  }
++  func.func private @foo_3(%arg0: i32) -> i32 {
++    %0 = arith.addi %arg0, %arg0 : i32
++    return %0 : i32
++  }
++  func.func private @foo_12(%arg0: i32) -> i32 {
++    %0 = arith.muli %arg0, %arg0 : i32
++    return %0 : i32
++  }
++  func.func private @bar_5(%arg0: i32) -> i32 {
++    %0 = call @foo_3(%arg0) : (i32) -> i32
++    return %0 : i32
++  }
++  func.func @public_7() {
++    return
++  }
++}
++
++// -----
++
++// The names do not depend on the original numbering or order. Changing a
++// function renames it, but not its callers.
++
++// CHECK-LABEL: module @second
++// CHECK: func.func private @[[FOO_MUL]](
++// CHECK: func.func private @[[FOO_SUB:foo_[0-9a-f]{8}]](
++// CHECK: func.func private @[[BAR]](
++// CHECK:   call @[[FOO_SUB]](
++module @second {
++  func.func private @foo_1(%arg0: i32) -> i32 {
++    %0 = arith.muli %arg0, %arg0 : i32
++    return %0 : i32
++  }
++  func.func private @foo_2(%arg0: i32) -> i32 {
++    %0 = arith.subi %arg0, %arg0 : i32
++    return %0 : i32
++  }
++  func.func private @bar_3(%arg0: i32) -> i32 {
++    %0 = call @foo_2(%arg0) : (i32) -> i32
++    return %0 : i32
++  }
++}
++
++// -----
++
++// Identical functions are told apart by a suffix, in order.
++
++// CHECK-LABEL: module @duplicates
++// CHECK: func.func private @[[DUP:dup_[0-9a-f]{8}]](
++// CHECK: func.func private @[[DUP]]_1(
++// CHECK: func.func @user(
++// CHECK:   call @[[DUP]](
++// CHECK:   call @[[DUP]]_1(
++module @duplicates {
++  func.func private @dup_1(%arg0: i32) -> i32 {
++    %0 = arith.addi %arg0, %arg0 : i32
++    return %0 : i32
++  }
++  func.func private @dup_2(%arg0: i32) -> i32 {
++    %0 = arith.addi %arg0, %arg0 : i32
++    return %0 : i32
++  }
++  func.func @user(%arg0: i32) -> i32 {
++    %0 = call @dup_1(%arg0) : (i32) -> i32
++    %1 = call @dup_2(%0) : (i32) -> i32
++    return %1 : i32
++  }
++}
++
++// -----
++
++// References within a nested symbol table refer to the symbols of that table.
++
++// CHECK-LABEL: module @nested
++// CHECK: func.func private @[[OUTER:f_[0-9a-f]{8}]]()
++// CHECK: func.func @outer_user()
++// CHECK:   call @[[OUTER]]()
++// CHECK: module @inner
++// CHECK:   func.func private @[[INNER:f_[0-9a-f]{8}]]()
++// CHECK:   func.func @inner_user()
++// CHECK:     call @[[INNER]]()
++module @nested {
++  func.func private @f_1() -> i32 {
++    %c1_i32 = arith.constant 1 : i32
++    return %c1_i32 : i32
++  }
++  func.func @outer_user() -> i32 {
++    %0 = call @f_1() : () -> i32
++    return %0 : i32
++  }
++  module @inner {
++    func.func private @f_1() -> i32 {
++      %c2_i32 = arith.constant 2 : i32
++      return %c2_i32 : i32
++    }
++    func.func @inner_user() -> i32 {
++      %0 = call @f_1() : () -> i32
++      return %0 : i32
++    }
++  }
++}
