@@ -41,6 +41,25 @@ elseif(${IREE_TRACING_PROVIDER} STREQUAL "tracy")
       "IREE_TRACING_MODE=${IREE_TRACING_MODE}"
     PUBLIC
   )
+elseif(${IREE_TRACING_PROVIDER} STREQUAL "csvgpu")
+  # Records per-dispatch GPU times to a CSV and nothing else. Consumes the
+  # timestamps the Vulkan HAL already collects, so that dispatch cost can be
+  # measured without building or running Tracy.
+  iree_cc_library(
+    NAME
+      provider
+    HDRS
+      "csvgpu.h"
+    SRCS
+      "csvgpu.c"
+    DEPS
+      iree::base::core_headers
+      iree::base::internal::time
+    DEFINES
+      "IREE_TRACING_PROVIDER_H=\"iree/base/tracing/csvgpu.h\""
+      "IREE_TRACING_MODE=${IREE_TRACING_MODE}"
+    PUBLIC
+  )
 else()
   # Add the dep so that the user-provided provider is linked in.
   # The user will also need to have set a header to include via
