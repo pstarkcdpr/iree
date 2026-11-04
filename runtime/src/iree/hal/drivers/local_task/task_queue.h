@@ -13,6 +13,7 @@
 #include "iree/base/internal/arena.h"
 #include "iree/hal/api.h"
 #include "iree/hal/drivers/local_task/task_queue_state.h"
+#include "iree/hal/local/profile_recorder.h"
 #include "iree/task/executor.h"
 #include "iree/task/scope.h"
 #include "iree/task/task.h"
@@ -90,6 +91,12 @@ typedef struct iree_hal_task_queue_t {
   // The intra-queue synchronization (barriers/events) carries across command
   // buffers and this is used to rendezvous the tasks in each set.
   iree_hal_task_queue_state_t state;
+
+  // Active HAL-native profiling session borrowed from the device, or NULL when
+  // not profiling. Command buffers recorded for the queue retain it.
+  iree_hal_local_profile_recorder_t* profile_recorder;
+  // Ordinal of this queue within the device as reported in profiles.
+  uint32_t profile_queue_ordinal;
 } iree_hal_task_queue_t;
 
 void iree_hal_task_queue_initialize(

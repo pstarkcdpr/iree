@@ -131,12 +131,14 @@ iree_runtime_cc_library(
     srcs = [
         "inline_command_buffer.c",
         "local_executable_cache.c",
+        "profile_recorder.c",
     ],
     hdrs = [
         "executable_loader.h",
         "inline_command_buffer.h",
         "local_executable.h",
         "local_executable_cache.h",
+        "profile_recorder.h",
     ],
     deps = [
         ":executable_environment",
@@ -145,6 +147,19 @@ iree_runtime_cc_library(
         "//runtime/src/iree/base/internal",
         "//runtime/src/iree/base/internal:cpu",
         "//runtime/src/iree/base/internal:fpu_state",
+        "//runtime/src/iree/base/threading",
         "//runtime/src/iree/hal",
+    ],
+)
+
+iree_runtime_cc_test(
+    name = "profile_recorder_test",
+    srcs = ["profile_recorder_test.cc"],
+    deps = [
+        ":local",
+        "//runtime/src/iree/base",
+        "//runtime/src/iree/hal",
+        "//runtime/src/iree/testing:gtest",
+        "//runtime/src/iree/testing:gtest_main",
     ],
 )

@@ -150,9 +150,11 @@ iree_cc_library(
     "inline_command_buffer.h"
     "local_executable.h"
     "local_executable_cache.h"
+    "profile_recorder.h"
   SRCS
     "inline_command_buffer.c"
     "local_executable_cache.c"
+    "profile_recorder.c"
   DEPS
     ::executable_environment
     ::executable_library
@@ -160,8 +162,22 @@ iree_cc_library(
     iree::base::internal
     iree::base::internal::cpu
     iree::base::internal::fpu_state
+    iree::base::threading
     iree::hal
   PUBLIC
+)
+
+iree_cc_test(
+  NAME
+    profile_recorder_test
+  SRCS
+    "profile_recorder_test.cc"
+  DEPS
+    ::local
+    iree::base
+    iree::hal
+    iree::testing::gtest
+    iree::testing::gtest_main
 )
 
 ### BAZEL_TO_CMAKE_PRESERVES_ALL_CONTENT_BELOW_THIS_LINE ###

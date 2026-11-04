@@ -20,6 +20,7 @@
 #include "iree/hal/local/executable_environment.h"
 #include "iree/hal/local/inline_command_buffer.h"
 #include "iree/hal/local/local_executable_cache.h"
+#include "iree/hal/local/profile_recorder.h"
 #include "iree/hal/utils/deferred_command_buffer.h"
 #include "iree/hal/utils/file_registry.h"
 #include "iree/hal/utils/file_transfer.h"
@@ -58,6 +59,9 @@ typedef struct iree_hal_sync_device_t {
   // Block pool used for command buffers with a larger block size (as command
   // buffers can contain inlined data uploads).
   iree_arena_block_pool_t large_block_pool;
+
+  // Active HAL-native profiling session, or NULL when not profiling.
+  iree_hal_local_profile_recorder_t* profile_recorder;
 
   iree_host_size_t loader_count;
   iree_hal_executable_loader_t* loaders[];
@@ -182,6 +186,8 @@ static void iree_hal_sync_device_destroy(iree_hal_device_t* base_device) {
   iree_hal_sync_device_t* device = iree_hal_sync_device_cast(base_device);
   iree_allocator_t host_allocator = iree_hal_device_host_allocator(base_device);
   IREE_TRACE_ZONE_BEGIN(z0);
+
+  iree_hal_local_profile_recorder_release(device->profile_recorder);
 
   for (iree_host_size_t i = 0; i < device->loader_count; ++i) {
     iree_hal_executable_loader_release(device->loaders[i]);
@@ -317,14 +323,14 @@ static iree_status_t iree_hal_sync_device_create_command_buffer(
     iree_hal_command_category_t command_categories,
     iree_hal_queue_affinity_t queue_affinity, iree_host_size_t binding_capacity,
     iree_hal_command_buffer_t** out_command_buffer) {
+  iree_hal_sync_device_t* device = iree_hal_sync_device_cast(base_device);
   if (iree_all_bits_set(mode,
                         IREE_HAL_COMMAND_BUFFER_MODE_ALLOW_INLINE_EXECUTION)) {
     return iree_hal_inline_command_buffer_create(
         iree_hal_device_allocator(base_device), mode, command_categories,
-        queue_affinity, binding_capacity,
+        queue_affinity, binding_capacity, device->profile_recorder,
         iree_hal_device_host_allocator(base_device), out_command_buffer);
   } else {
-    iree_hal_sync_device_t* device = iree_hal_sync_device_cast(base_device);
     return iree_hal_deferred_command_buffer_create(
         iree_hal_device_allocator(base_device), mode, command_categories,
         queue_affinity, binding_capacity, &device->large_block_pool,
@@ -560,8 +566,8 @@ static iree_status_t iree_hal_sync_device_apply_deferred_command_buffer(
                : 0),
       iree_hal_command_buffer_allowed_categories(command_buffer),
       IREE_HAL_QUEUE_AFFINITY_ANY,
-      /*binding_capacity=*/0, device->host_allocator, storage,
-      &inline_command_buffer));
+      /*binding_capacity=*/0, device->profile_recorder, device->host_allocator,
+      storage, &inline_command_buffer));
 
   iree_status_t status = iree_hal_deferred_command_buffer_apply(
       command_buffer, inline_command_buffer, binding_table);
@@ -621,20 +627,33 @@ static iree_status_t iree_hal_sync_device_queue_flush(
 static iree_status_t iree_hal_sync_device_profiling_begin(
     iree_hal_device_t* base_device,
     const iree_hal_device_profiling_options_t* options) {
-  return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                          "local-sync HAL-native profiling is not implemented");
+  iree_hal_sync_device_t* device = iree_hal_sync_device_cast(base_device);
+  if (device->profile_recorder) {
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                            "profiling session already active");
+  }
+  return iree_hal_local_profile_recorder_create(
+      options, device->identifier, /*queue_count=*/1, device->host_allocator,
+      &device->profile_recorder);
 }
 
 static iree_status_t iree_hal_sync_device_profiling_flush(
     iree_hal_device_t* base_device) {
-  // Unimplemented (and that's ok).
-  return iree_ok_status();
+  iree_hal_sync_device_t* device = iree_hal_sync_device_cast(base_device);
+  if (!device->profile_recorder) return iree_ok_status();
+  return iree_hal_local_profile_recorder_flush(device->profile_recorder);
 }
 
 static iree_status_t iree_hal_sync_device_profiling_end(
     iree_hal_device_t* base_device) {
-  // Unimplemented (and that's ok).
-  return iree_ok_status();
+  iree_hal_sync_device_t* device = iree_hal_sync_device_cast(base_device);
+  if (!device->profile_recorder) return iree_ok_status();
+  iree_status_t status =
+      iree_hal_local_profile_recorder_end(device->profile_recorder);
+  // Command buffers recorded during the session may still hold references.
+  iree_hal_local_profile_recorder_release(device->profile_recorder);
+  device->profile_recorder = NULL;
+  return status;
 }
 
 static iree_status_t iree_hal_sync_device_external_capture_begin(

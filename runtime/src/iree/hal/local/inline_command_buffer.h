@@ -9,6 +9,7 @@
 
 #include "iree/base/api.h"
 #include "iree/hal/api.h"
+#include "iree/hal/local/profile_recorder.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,6 +26,9 @@ iree_host_size_t iree_hal_inline_command_buffer_size(
 // caller-allocated |storage| (must be at least the capacity specified by
 // iree_hal_inline_command_buffer_size).
 //
+// If |profile_recorder| is non-NULL it is retained and receives a host
+// execution event for every dispatch executed by the command buffer.
+//
 // NOTE: this must only be used when the command buffer handle cannot escape
 // the caller: attempting to use the resulting command buffer as a ref object
 // is invalid.
@@ -32,6 +36,7 @@ iree_status_t iree_hal_inline_command_buffer_initialize(
     iree_hal_allocator_t* device_allocator, iree_hal_command_buffer_mode_t mode,
     iree_hal_command_category_t command_categories,
     iree_hal_queue_affinity_t queue_affinity, iree_host_size_t binding_capacity,
+    iree_hal_local_profile_recorder_t* profile_recorder,
     iree_allocator_t host_allocator, iree_byte_span_t storage,
     iree_hal_command_buffer_t** out_command_buffer);
 
@@ -48,11 +53,15 @@ void iree_hal_inline_command_buffer_deinitialize(
 //
 // Executes all work on the calling thread synchronously (today).
 //
+// If |profile_recorder| is non-NULL it is retained and receives a host
+// execution event for every dispatch executed by the command buffer.
+//
 // Must have IREE_HAL_COMMAND_BUFFER_MODE_ALLOW_INLINE_EXECUTION set.
 iree_status_t iree_hal_inline_command_buffer_create(
     iree_hal_allocator_t* device_allocator, iree_hal_command_buffer_mode_t mode,
     iree_hal_command_category_t command_categories,
     iree_hal_queue_affinity_t queue_affinity, iree_host_size_t binding_capacity,
+    iree_hal_local_profile_recorder_t* profile_recorder,
     iree_allocator_t host_allocator,
     iree_hal_command_buffer_t** out_command_buffer);
 

@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include "iree/base/api.h"
+#include "iree/base/internal/atomics.h"
 #include "iree/hal/local/executable_environment.h"
 #include "iree/hal/local/executable_library.h"
 #include "iree/hal/local/local_executable.h"
@@ -58,6 +59,15 @@ typedef struct iree_hal_task_command_buffer_t {
   // An empty list indicates that root_tasks are also the leaves.
   iree_task_list_t leaf_tasks;
 
+  // Optional retained profiling session receiving dispatch execution spans.
+  iree_hal_local_profile_recorder_t* profile_recorder;
+  // Session-local identifier of this command buffer.
+  uint64_t profile_command_buffer_id;
+  // Queue ordinal reported for events from this command buffer.
+  uint32_t profile_queue_ordinal;
+  // Number of dispatches recorded; used as the command index.
+  uint32_t profile_dispatch_count;
+
   // TODO(benvanik): move this out of the struct and allocate from the arena -
   // we only need this during recording and it's ~4KB of waste otherwise.
   // State tracked within the command buffer during recording only.
@@ -93,7 +103,9 @@ iree_status_t iree_hal_task_command_buffer_create(
     iree_hal_command_buffer_mode_t mode,
     iree_hal_command_category_t command_categories,
     iree_hal_queue_affinity_t queue_affinity, iree_host_size_t binding_capacity,
-    iree_arena_block_pool_t* block_pool, iree_allocator_t host_allocator,
+    iree_hal_local_profile_recorder_t* profile_recorder,
+    uint32_t profile_queue_ordinal, iree_arena_block_pool_t* block_pool,
+    iree_allocator_t host_allocator,
     iree_hal_command_buffer_t** out_command_buffer) {
   IREE_ASSERT_ARGUMENT(out_command_buffer);
   *out_command_buffer = NULL;
@@ -135,11 +147,22 @@ iree_status_t iree_hal_task_command_buffer_create(
     iree_arena_initialize(block_pool, &command_buffer->arena);
     iree_task_list_initialize(&command_buffer->root_tasks);
     iree_task_list_initialize(&command_buffer->leaf_tasks);
+    command_buffer->profile_recorder = profile_recorder;
+    iree_hal_local_profile_recorder_retain(profile_recorder);
+    command_buffer->profile_command_buffer_id = 0;
+    command_buffer->profile_queue_ordinal = profile_queue_ordinal;
+    command_buffer->profile_dispatch_count = 0;
     memset(&command_buffer->state, 0, sizeof(command_buffer->state));
     if (!iree_all_bits_set(mode, IREE_HAL_COMMAND_BUFFER_MODE_UNRETAINED)) {
       status = iree_hal_resource_set_allocate(block_pool,
                                               &command_buffer->resource_set);
     }
+  }
+  // Task command buffers are one-shot so registration happens once here.
+  if (iree_status_is_ok(status) && profile_recorder) {
+    status = iree_hal_local_profile_recorder_register_command_buffer(
+        profile_recorder, &command_buffer->base,
+        &command_buffer->profile_command_buffer_id);
   }
   if (iree_status_is_ok(status)) {
     *out_command_buffer = &command_buffer->base;
@@ -163,6 +186,7 @@ static void iree_hal_task_command_buffer_destroy(
   iree_task_list_discard(&command_buffer->leaf_tasks);
   iree_arena_deinitialize(&command_buffer->arena);
   iree_hal_resource_set_free(command_buffer->resource_set);
+  iree_hal_local_profile_recorder_release(command_buffer->profile_recorder);
   iree_allocator_free(host_allocator, command_buffer);
 
   IREE_TRACE_ZONE_END(z0);
@@ -719,6 +743,26 @@ static iree_status_t iree_hal_task_command_buffer_collective(
 // iree_hal_command_buffer_dispatch
 //===----------------------------------------------------------------------===//
 
+// Profiling state for a dispatch, accumulated by the tiles as they execute on
+// the workers. Only allocated when the dispatch is being profiled.
+typedef struct iree_hal_task_cmd_dispatch_profile_t {
+  // Borrowed; the owning command buffer retains the recorder.
+  iree_hal_local_profile_recorder_t* recorder;
+  // Earliest tile start time or 0 if no tile has started.
+  iree_atomic_int64_t start_time_ns;
+  // Latest tile end time.
+  iree_atomic_int64_t end_time_ns;
+  // Sum of all tile durations across all workers.
+  iree_atomic_int64_t tile_duration_sum_ns;
+  // Number of tiles that have completed. The tile completing the last one
+  // reports the event.
+  iree_atomic_int64_t tiles_completed;
+  // First non-OK status code produced by a tile.
+  iree_atomic_int32_t status_code;
+  // Event with its identity fields populated at record time.
+  iree_hal_profile_host_execution_event_t event;
+} iree_hal_task_cmd_dispatch_profile_t;
+
 typedef struct iree_hal_task_cmd_dispatch_t {
   iree_task_dispatch_t task;
   iree_hal_local_executable_t* executable;
@@ -732,11 +776,86 @@ typedef struct iree_hal_task_cmd_dispatch_t {
   // used (known at compile-time).
   uint16_t binding_count;
 
+  // Profiling state or NULL if the dispatch is not being profiled.
+  iree_hal_task_cmd_dispatch_profile_t* profile;
+
   // Following this structure in memory there are 3 tables:
   // - const uint32_t constants[constant_count];
   // - void* binding_ptrs[binding_count];
   // - const size_t binding_lengths[binding_count];
 } iree_hal_task_cmd_dispatch_t;
+
+static void iree_hal_task_cmd_dispatch_profile_atomic_min(
+    iree_atomic_int64_t* value, int64_t candidate) {
+  int64_t current = iree_atomic_load(value, iree_memory_order_relaxed);
+  while ((current == 0 || candidate < current) &&
+         !iree_atomic_compare_exchange_weak(value, &current, candidate,
+                                            iree_memory_order_relaxed,
+                                            iree_memory_order_relaxed)) {
+  }
+}
+
+static void iree_hal_task_cmd_dispatch_profile_atomic_max(
+    iree_atomic_int64_t* value, int64_t candidate) {
+  int64_t current = iree_atomic_load(value, iree_memory_order_relaxed);
+  while (candidate > current &&
+         !iree_atomic_compare_exchange_weak(value, &current, candidate,
+                                            iree_memory_order_relaxed,
+                                            iree_memory_order_relaxed)) {
+  }
+}
+
+// Accumulates one completed tile and reports the dispatch once all tiles have
+// completed. The dispatch span runs from the first tile start to the last tile
+// end and so excludes the task system's scheduling latency before the first
+// tile runs.
+static void iree_hal_task_cmd_dispatch_profile_record_tile(
+    iree_hal_task_cmd_dispatch_profile_t* profile,
+    const iree_task_tile_context_t* tile_context, iree_time_t start_time_ns,
+    iree_time_t end_time_ns, iree_status_code_t status_code) {
+  iree_hal_task_cmd_dispatch_profile_atomic_min(&profile->start_time_ns,
+                                                start_time_ns);
+  iree_hal_task_cmd_dispatch_profile_atomic_max(&profile->end_time_ns,
+                                                end_time_ns);
+  iree_atomic_fetch_add(&profile->tile_duration_sum_ns,
+                        end_time_ns - start_time_ns, iree_memory_order_relaxed);
+  if (IREE_UNLIKELY(status_code != IREE_STATUS_OK)) {
+    int32_t expected = IREE_STATUS_OK;
+    iree_atomic_compare_exchange_strong(
+        &profile->status_code, &expected, (int32_t)status_code,
+        iree_memory_order_relaxed, iree_memory_order_relaxed);
+  }
+
+  // The release half publishes this tile's updates and the acquire half on the
+  // final increment makes all tiles' updates visible to the reporting tile.
+  const uint64_t tile_count = (uint64_t)tile_context->workgroup_count[0] *
+                              tile_context->workgroup_count[1] *
+                              tile_context->workgroup_count[2];
+  const int64_t tiles_completed =
+      iree_atomic_fetch_add(&profile->tiles_completed, 1,
+                            iree_memory_order_acq_rel) +
+      1;
+  if ((uint64_t)tiles_completed != tile_count) return;
+
+  iree_hal_profile_host_execution_event_t event = profile->event;
+  event.status_code = (uint32_t)iree_atomic_load(&profile->status_code,
+                                                 iree_memory_order_relaxed);
+  for (iree_host_size_t i = 0; i < IREE_ARRAYSIZE(event.workgroup_count); ++i) {
+    event.workgroup_count[i] = tile_context->workgroup_count[i];
+    // Unspecified sizes are 0 here; report them as 1 like the inline path.
+    event.workgroup_size[i] =
+        tile_context->workgroup_size[i] ? tile_context->workgroup_size[i] : 1;
+  }
+  event.start_host_time_ns =
+      iree_atomic_load(&profile->start_time_ns, iree_memory_order_relaxed);
+  event.end_host_time_ns =
+      iree_atomic_load(&profile->end_time_ns, iree_memory_order_relaxed);
+  event.tile_count = tile_count;
+  event.tile_duration_sum_ns = iree_atomic_load(&profile->tile_duration_sum_ns,
+                                                iree_memory_order_relaxed);
+  iree_hal_local_profile_recorder_append_host_execution_event(profile->recorder,
+                                                              &event);
+}
 
 static iree_status_t iree_hal_task_cmd_dispatch_tile(
     void* user_context, const iree_task_tile_context_t* tile_context,
@@ -792,9 +911,16 @@ static iree_status_t iree_hal_task_cmd_dispatch_tile(
           .local_memory = tile_context->local_memory.data,
           .local_memory_size = (size_t)tile_context->local_memory.data_length,
       };
+  iree_hal_task_cmd_dispatch_profile_t* profile = cmd->profile;
+  const iree_time_t start_time_ns = profile ? iree_time_now() : 0;
   iree_status_t status = iree_hal_local_executable_issue_call(
       cmd->executable, cmd->ordinal, &dispatch_state, &workgroup_state,
       tile_context->worker_id);
+  if (IREE_UNLIKELY(profile)) {
+    iree_hal_task_cmd_dispatch_profile_record_tile(
+        profile, tile_context, start_time_ns, iree_time_now(),
+        iree_status_code(status));
+  }
 
   IREE_TRACE_ZONE_END(z0);
   return status;
@@ -845,6 +971,36 @@ static iree_status_t iree_hal_task_command_buffer_dispatch(
   cmd->ordinal = export_ordinal;
   cmd->constant_count = dispatch_attrs.constant_count;
   cmd->binding_count = dispatch_attrs.binding_count;
+  cmd->profile = NULL;
+  if (command_buffer->profile_recorder) {
+    bool profile_dispatch = false;
+    iree_hal_profile_host_execution_event_t profile_event;
+    IREE_RETURN_IF_ERROR(iree_hal_local_profile_recorder_prepare_dispatch(
+        command_buffer->profile_recorder, command_buffer->profile_queue_ordinal,
+        command_buffer->profile_command_buffer_id,
+        command_buffer->profile_dispatch_count++, executable, export_ordinal,
+        &profile_dispatch, &profile_event));
+    if (profile_dispatch) {
+      // Isolated on its own cache lines as every tile writes to it while
+      // other workers read the adjacent command data.
+      iree_hal_task_cmd_dispatch_profile_t* profile = NULL;
+      IREE_RETURN_IF_ERROR(iree_arena_allocate_aligned(
+          &command_buffer->arena,
+          iree_host_align(sizeof(*profile),
+                          iree_hardware_destructive_interference_size),
+          iree_hardware_destructive_interference_size, (void**)&profile));
+      memset(profile, 0, sizeof(*profile));
+      profile->recorder = command_buffer->profile_recorder;
+      profile->event = profile_event;
+      profile->event.flags |=
+          IREE_HAL_PROFILE_HOST_EXECUTION_EVENT_FLAG_DEFERRED;
+      if (iree_hal_dispatch_uses_indirect_parameters(flags)) {
+        profile->event.flags |=
+            IREE_HAL_PROFILE_HOST_EXECUTION_EVENT_FLAG_INDIRECT_PARAMETERS;
+      }
+      cmd->profile = profile;
+    }
+  }
 
   iree_task_dispatch_initialize(
       command_buffer->scope,

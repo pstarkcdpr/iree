@@ -216,6 +216,7 @@ static iree_status_t iree_hal_task_queue_issue_cmd_deferred(
                    : 0),
           iree_hal_command_buffer_allowed_categories(command_buffer),
           cmd->queue->affinity, /*binding_capacity=*/0,
+          cmd->queue->profile_recorder, cmd->queue->profile_queue_ordinal,
           cmd->queue->large_block_pool,
           iree_hal_allocator_host_allocator(cmd->queue->device_allocator),
           &task_command_buffer));

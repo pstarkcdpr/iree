@@ -62,6 +62,10 @@ typedef struct iree_hal_task_device_t {
 
   iree_hal_device_topology_info_t topology_info;
 
+  // Active HAL-native profiling session, or NULL when not profiling. Queues
+  // borrow this reference while it is active.
+  iree_hal_local_profile_recorder_t* profile_recorder;
+
   iree_host_size_t queue_count;
   iree_hal_task_queue_t queues[];
 } iree_hal_task_device_t;
@@ -217,6 +221,7 @@ static void iree_hal_task_device_destroy(iree_hal_device_t* base_device) {
   for (iree_host_size_t i = 0; i < device->queue_count; ++i) {
     iree_hal_task_queue_deinitialize(&device->queues[i]);
   }
+  iree_hal_local_profile_recorder_release(device->profile_recorder);
 
   for (iree_host_size_t i = 0; i < device->loader_count; ++i) {
     iree_hal_executable_loader_release(device->loaders[i]);
@@ -396,11 +401,12 @@ static iree_status_t iree_hal_task_device_create_command_buffer(
   } else {
     iree_host_size_t queue_index = iree_hal_task_device_select_queue(
         device, command_categories, queue_affinity);
+    iree_hal_task_queue_t* queue = &device->queues[queue_index];
     return iree_hal_task_command_buffer_create(
-        iree_hal_device_allocator(base_device),
-        &device->queues[queue_index].scope, mode, command_categories,
-        queue_affinity, binding_capacity, &device->large_block_pool,
-        device->host_allocator, out_command_buffer);
+        iree_hal_device_allocator(base_device), &queue->scope, mode,
+        command_categories, queue_affinity, binding_capacity,
+        queue->profile_recorder, queue->profile_queue_ordinal,
+        &device->large_block_pool, device->host_allocator, out_command_buffer);
   }
 }
 
@@ -624,20 +630,41 @@ static iree_status_t iree_hal_task_device_queue_flush(
 static iree_status_t iree_hal_task_device_profiling_begin(
     iree_hal_device_t* base_device,
     const iree_hal_device_profiling_options_t* options) {
-  return iree_make_status(IREE_STATUS_UNIMPLEMENTED,
-                          "local-task HAL-native profiling is not implemented");
+  iree_hal_task_device_t* device = iree_hal_task_device_cast(base_device);
+  if (device->profile_recorder) {
+    return iree_make_status(IREE_STATUS_FAILED_PRECONDITION,
+                            "profiling session already active");
+  }
+  IREE_RETURN_IF_ERROR(iree_hal_local_profile_recorder_create(
+      options, device->identifier, device->queue_count, device->host_allocator,
+      &device->profile_recorder));
+  for (iree_host_size_t i = 0; i < device->queue_count; ++i) {
+    device->queues[i].profile_recorder = device->profile_recorder;
+    device->queues[i].profile_queue_ordinal = (uint32_t)i;
+  }
+  return iree_ok_status();
 }
 
 static iree_status_t iree_hal_task_device_profiling_flush(
     iree_hal_device_t* base_device) {
-  // Unimplemented (and that's ok).
-  return iree_ok_status();
+  iree_hal_task_device_t* device = iree_hal_task_device_cast(base_device);
+  if (!device->profile_recorder) return iree_ok_status();
+  return iree_hal_local_profile_recorder_flush(device->profile_recorder);
 }
 
 static iree_status_t iree_hal_task_device_profiling_end(
     iree_hal_device_t* base_device) {
-  // Unimplemented (and that's ok).
-  return iree_ok_status();
+  iree_hal_task_device_t* device = iree_hal_task_device_cast(base_device);
+  if (!device->profile_recorder) return iree_ok_status();
+  for (iree_host_size_t i = 0; i < device->queue_count; ++i) {
+    device->queues[i].profile_recorder = NULL;
+  }
+  iree_status_t status =
+      iree_hal_local_profile_recorder_end(device->profile_recorder);
+  // Command buffers recorded during the session may still hold references.
+  iree_hal_local_profile_recorder_release(device->profile_recorder);
+  device->profile_recorder = NULL;
+  return status;
 }
 
 static iree_status_t iree_hal_task_device_external_capture_begin(

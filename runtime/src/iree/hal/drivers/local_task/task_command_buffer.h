@@ -11,6 +11,7 @@
 #include "iree/base/internal/arena.h"
 #include "iree/hal/api.h"
 #include "iree/hal/drivers/local_task/task_queue_state.h"
+#include "iree/hal/local/profile_recorder.h"
 #include "iree/task/scope.h"
 #include "iree/task/task.h"
 
@@ -18,12 +19,19 @@
 extern "C" {
 #endif  // __cplusplus
 
+// Creates a one-shot command buffer that records directly into a task DAG.
+//
+// If |profile_recorder| is non-NULL it is retained and receives a host
+// execution event for every dispatch executed by the command buffer, reported
+// on queue |profile_queue_ordinal|.
 iree_status_t iree_hal_task_command_buffer_create(
     iree_hal_allocator_t* device_allocator, iree_task_scope_t* scope,
     iree_hal_command_buffer_mode_t mode,
     iree_hal_command_category_t command_categories,
     iree_hal_queue_affinity_t queue_affinity, iree_host_size_t binding_capacity,
-    iree_arena_block_pool_t* block_pool, iree_allocator_t host_allocator,
+    iree_hal_local_profile_recorder_t* profile_recorder,
+    uint32_t profile_queue_ordinal, iree_arena_block_pool_t* block_pool,
+    iree_allocator_t host_allocator,
     iree_hal_command_buffer_t** out_command_buffer);
 
 // Returns true if |command_buffer| is a task system command buffer.

@@ -26,6 +26,13 @@ typedef struct iree_hal_inline_command_buffer_t {
   iree_hal_command_buffer_t base;
   iree_allocator_t host_allocator;
 
+  // Optional retained profiling session receiving dispatch execution spans.
+  iree_hal_local_profile_recorder_t* profile_recorder;
+  // Session-local identifier of the current recording, assigned on begin.
+  uint64_t profile_command_buffer_id;
+  // Number of dispatches recorded since begin; used as the command index.
+  uint32_t profile_dispatch_count;
+
   struct {
     // Cached and initialized dispatch state reused for all dispatches.
     // Individual dispatches must populate the dynamically changing fields like
@@ -74,6 +81,7 @@ iree_status_t iree_hal_inline_command_buffer_initialize(
     iree_hal_allocator_t* device_allocator, iree_hal_command_buffer_mode_t mode,
     iree_hal_command_category_t command_categories,
     iree_hal_queue_affinity_t queue_affinity, iree_host_size_t binding_capacity,
+    iree_hal_local_profile_recorder_t* profile_recorder,
     iree_allocator_t host_allocator, iree_byte_span_t storage,
     iree_hal_command_buffer_t** out_command_buffer) {
   IREE_ASSERT_ARGUMENT(out_command_buffer);
@@ -113,6 +121,8 @@ iree_status_t iree_hal_inline_command_buffer_initialize(
       binding_capacity, (uint8_t*)command_buffer + sizeof(*command_buffer),
       &iree_hal_inline_command_buffer_vtable, &command_buffer->base);
   command_buffer->host_allocator = host_allocator;
+  command_buffer->profile_recorder = profile_recorder;
+  iree_hal_local_profile_recorder_retain(profile_recorder);
   iree_hal_inline_command_buffer_reset(command_buffer);
 
   *out_command_buffer = &command_buffer->base;
@@ -126,12 +136,15 @@ void iree_hal_inline_command_buffer_deinitialize(
   iree_hal_inline_command_buffer_t* command_buffer =
       iree_hal_inline_command_buffer_cast(base_command_buffer);
   iree_hal_inline_command_buffer_reset(command_buffer);
+  iree_hal_local_profile_recorder_release(command_buffer->profile_recorder);
+  command_buffer->profile_recorder = NULL;
 }
 
 iree_status_t iree_hal_inline_command_buffer_create(
     iree_hal_allocator_t* device_allocator, iree_hal_command_buffer_mode_t mode,
     iree_hal_command_category_t command_categories,
     iree_hal_queue_affinity_t queue_affinity, iree_host_size_t binding_capacity,
+    iree_hal_local_profile_recorder_t* profile_recorder,
     iree_allocator_t host_allocator,
     iree_hal_command_buffer_t** out_command_buffer) {
   IREE_ASSERT_ARGUMENT(out_command_buffer);
@@ -147,7 +160,7 @@ iree_status_t iree_hal_inline_command_buffer_create(
   if (iree_status_is_ok(status)) {
     status = iree_hal_inline_command_buffer_initialize(
         device_allocator, mode, command_categories, queue_affinity,
-        binding_capacity, host_allocator,
+        binding_capacity, profile_recorder, host_allocator,
         iree_make_byte_span(storage, iree_hal_inline_command_buffer_size(
                                          mode, binding_capacity)),
         &command_buffer);
@@ -200,6 +213,15 @@ static iree_status_t iree_hal_inline_command_buffer_begin(
 
   // Query the processor ID we start out on. We may update it during execution.
   iree_hal_inline_command_buffer_update_processor_id(command_buffer);
+
+  // Each recording is a distinct execution and gets its own profile identity.
+  command_buffer->profile_dispatch_count = 0;
+  if (command_buffer->profile_recorder) {
+    IREE_RETURN_IF_ERROR(
+        iree_hal_local_profile_recorder_register_command_buffer(
+            command_buffer->profile_recorder, base_command_buffer,
+            &command_buffer->profile_command_buffer_id));
+  }
 
   return iree_ok_status();
 }
@@ -478,14 +500,52 @@ static iree_status_t iree_hal_inline_command_buffer_dispatch(
                                                (void**)&local_memory.data));
   }
 
-  // Since we are running on a borrowed thread, we know nothing about the
-  // floating point state. Reset it.
-  iree_fpu_state_t fpu_state =
-      iree_fpu_state_push(IREE_FPU_STATE_FLAG_FLUSH_DENORMALS_TO_ZERO);
-  iree_status_t status = iree_hal_local_executable_issue_dispatch_inline(
-      local_executable, export_ordinal, dispatch_state,
-      command_buffer->state.processor_id, local_memory);
-  iree_fpu_state_pop(fpu_state);
+  bool profile_dispatch = false;
+  iree_hal_profile_host_execution_event_t profile_event;
+  iree_status_t status = iree_ok_status();
+  if (command_buffer->profile_recorder) {
+    status = iree_hal_local_profile_recorder_prepare_dispatch(
+        command_buffer->profile_recorder, /*queue_ordinal=*/0,
+        command_buffer->profile_command_buffer_id,
+        command_buffer->profile_dispatch_count++, executable, export_ordinal,
+        &profile_dispatch, &profile_event);
+  }
+
+  if (iree_status_is_ok(status)) {
+    const iree_time_t start_time_ns = profile_dispatch ? iree_time_now() : 0;
+    // Since we are running on a borrowed thread, we know nothing about the
+    // floating point state. Reset it.
+    iree_fpu_state_t fpu_state =
+        iree_fpu_state_push(IREE_FPU_STATE_FLAG_FLUSH_DENORMALS_TO_ZERO);
+    status = iree_hal_local_executable_issue_dispatch_inline(
+        local_executable, export_ordinal, dispatch_state,
+        command_buffer->state.processor_id, local_memory);
+    iree_fpu_state_pop(fpu_state);
+    if (profile_dispatch) {
+      const iree_time_t end_time_ns = iree_time_now();
+      if (iree_hal_dispatch_uses_indirect_parameters(flags)) {
+        profile_event.flags |=
+            IREE_HAL_PROFILE_HOST_EXECUTION_EVENT_FLAG_INDIRECT_PARAMETERS;
+      }
+      profile_event.status_code = iree_status_code(status);
+      profile_event.workgroup_count[0] = dispatch_state->workgroup_count_x;
+      profile_event.workgroup_count[1] = dispatch_state->workgroup_count_y;
+      profile_event.workgroup_count[2] = dispatch_state->workgroup_count_z;
+      profile_event.workgroup_size[0] = dispatch_state->workgroup_size_x;
+      profile_event.workgroup_size[1] = dispatch_state->workgroup_size_y;
+      profile_event.workgroup_size[2] = dispatch_state->workgroup_size_z;
+      profile_event.start_host_time_ns = start_time_ns;
+      profile_event.end_host_time_ns = end_time_ns;
+      // Workgroups run back to back on this thread so their summed duration
+      // is the span itself.
+      profile_event.tile_count = (uint64_t)dispatch_state->workgroup_count_x *
+                                 dispatch_state->workgroup_count_y *
+                                 dispatch_state->workgroup_count_z;
+      profile_event.tile_duration_sum_ns = end_time_ns - start_time_ns;
+      iree_hal_local_profile_recorder_append_host_execution_event(
+          command_buffer->profile_recorder, &profile_event);
+    }
+  }
 
   if (local_memory.data) {
     iree_allocator_free(command_buffer->host_allocator, local_memory.data);
