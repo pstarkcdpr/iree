@@ -1,0 +1,5 @@
+# Patches and scripts must keep LF endings on every platform. A CRLF checkout
+# makes `git apply` report every added line as trailing whitespace and bakes
+# CRs into newly created files.
+*.patch text eol=lf
+*.sh text eol=lf
